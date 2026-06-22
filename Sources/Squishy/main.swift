@@ -162,6 +162,12 @@ struct MediaMetadata: Equatable {
         return "\(codec) · \(width)x\(height)\(fps)"
     }
 
+    var resolutionText: String? {
+        guard let width, let height else { return nil }
+        let fps = frameRate.map { " · \($0)" } ?? ""
+        return "\(width)\u{00d7}\(height)\(fps)"
+    }
+
     var audioText: String {
         guard let audioCodec else { return "No audio detected" }
         return "\(audioCodec.uppercased()) audio"
@@ -181,6 +187,10 @@ final class CompressorModel: ObservableObject {
     @Published var inputKind: SourceKind = .video
     @Published var settings = ExportSettings()
     @Published var metadata: MediaMetadata?
+    @Published var thumbnail: NSImage?
+    @Published var isLoadingSource = false
+    @Published var fileSizeBytes: Int64?
+    @Published var creationDate: Date?
     @Published var jobState: JobState = .idle
     @Published var progress: Double = 0
     @Published var statusText = "Choose a source video to begin."
@@ -194,7 +204,15 @@ final class CompressorModel: ObservableObject {
     @Published var youtubeDownloadLog = ""
     @Published var youtubeDownloadElapsed: TimeInterval = 0
 
+    @Published var isFetchingYoutubePreview = false
+    @Published var youtubePreviewTitle: String?
+    @Published var youtubePreviewDuration: Double?
+    @Published var youtubePreviewThumbnail: NSImage?
+
     private var youtubeDownloadTimer: Timer?
+    private var youtubePreviewDebounceTimer: Timer?
+    private var youtubePreviewProcess: Process?
+    private var youtubePreviewThumbnailTask: URLSessionDataTask?
 
     @Published var isYtDlpOutdated = false
     @Published var isUpdatingYtDlp = false
@@ -414,10 +432,95 @@ final class CompressorModel: ObservableObject {
         settings.outputName = "\(url.deletingPathExtension().lastPathComponent)-compressed"
         normalizeFormatForInputKind()
         metadata = loadMetadata(for: url)
+
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        fileSizeBytes = attributes?[.size] as? Int64
+        creationDate = attributes?[.creationDate] as? Date
+
         progress = 0
         statusText = "Ready to export \(url.lastPathComponent)."
         ffmpegLog = "Loaded source metadata."
         jobState = .idle
+
+        isLoadingSource = true
+        loadThumbnail(for: url)
+    }
+
+    func clearInput() {
+        inputURL = nil
+        metadata = nil
+        thumbnail = nil
+        isLoadingSource = false
+        fileSizeBytes = nil
+        creationDate = nil
+        progress = 0
+        statusText = ""
+        ffmpegLog = ""
+        jobState = .idle
+    }
+
+    var fileSizeText: String {
+        guard let fileSizeBytes else { return "Unknown size" }
+        return ByteCountFormatter.string(fromByteCount: fileSizeBytes, countStyle: .file)
+    }
+
+    var creationDateText: String {
+        guard let creationDate else { return "Unknown date" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: creationDate)
+    }
+
+    private func loadThumbnail(for url: URL) {
+        thumbnail = nil
+
+        if inputKind == .image {
+            thumbnail = NSImage(contentsOf: url)
+            isLoadingSource = false
+            return
+        }
+
+        guard let ffmpegPath else {
+            isLoadingSource = false
+            return
+        }
+        let duration = metadata?.duration ?? 0
+        let seekSeconds = duration > 1 ? min(duration * 0.1, 5) : 0
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("squishy-thumb-\(UUID().uuidString)")
+            .appendingPathExtension("jpg")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ffmpegPath)
+            process.arguments = [
+                "-hide_banner", "-y",
+                "-ss", "\(seekSeconds)",
+                "-i", url.path,
+                "-frames:v", "1",
+                "-q:v", "3",
+                tempURL.path
+            ]
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+
+            do {
+                try process.run()
+            } catch {
+                return
+            }
+            process.waitUntilExit()
+
+            let image = NSImage(contentsOf: tempURL)
+            try? FileManager.default.removeItem(at: tempURL)
+
+            DispatchQueue.main.async {
+                guard let self, self.inputURL == url else { return }
+                self.thumbnail = image
+                self.isLoadingSource = false
+            }
+        }
     }
 
     private func sourceKind(for url: URL) -> SourceKind {
@@ -669,6 +772,98 @@ final class CompressorModel: ObservableObject {
         return host.contains("youtube.com") || host.contains("youtu.be")
     }
 
+    func scheduleYoutubePreviewFetch() {
+        youtubePreviewDebounceTimer?.invalidate()
+        youtubePreviewProcess?.terminate()
+        youtubePreviewProcess = nil
+        youtubePreviewThumbnailTask?.cancel()
+        youtubePreviewThumbnailTask = nil
+        isFetchingYoutubePreview = false
+
+        let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
+        guard isValidYouTubeURL(trimmed) else {
+            youtubePreviewTitle = nil
+            youtubePreviewDuration = nil
+            youtubePreviewThumbnail = nil
+            return
+        }
+
+        youtubePreviewDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.fetchYoutubePreview(for: trimmed)
+            }
+        }
+    }
+
+    private func fetchYoutubePreview(for urlString: String) {
+        guard let ytDlpPath else { return }
+
+        isFetchingYoutubePreview = true
+        youtubePreviewTitle = nil
+        youtubePreviewDuration = nil
+        youtubePreviewThumbnail = nil
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ytDlpPath)
+        process.arguments = [
+            "--no-playlist", "--skip-download",
+            "--print", "%(title)s",
+            "--print", "%(duration)s",
+            "--print", "%(thumbnail)s",
+            urlString
+        ]
+
+        var environment = ProcessInfo.processInfo.environment
+        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let existingPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["PATH"] = (extraPaths + [existingPath]).joined(separator: ":")
+        process.environment = environment
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+        youtubePreviewProcess = process
+
+        process.terminationHandler = { [weak self] terminatedProcess in
+            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let lines = String(data: data, encoding: .utf8)?
+                .split(separator: "\n")
+                .map(String.init) ?? []
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.youtubePreviewProcess = nil
+                self.isFetchingYoutubePreview = false
+
+                guard terminatedProcess.terminationStatus == 0, lines.count >= 3 else { return }
+
+                self.youtubePreviewTitle = lines[0]
+                self.youtubePreviewDuration = Double(lines[1])
+
+                if let thumbnailURL = URL(string: lines[2]) {
+                    self.loadYoutubePreviewThumbnail(from: thumbnailURL)
+                }
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            isFetchingYoutubePreview = false
+        }
+    }
+
+    private func loadYoutubePreviewThumbnail(from url: URL) {
+        let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data, let image = NSImage(data: data) else { return }
+            DispatchQueue.main.async {
+                self?.youtubePreviewThumbnail = image
+            }
+        }
+        youtubePreviewThumbnailTask = task
+        task.resume()
+    }
+
     func downloadYouTube() {
         guard let ytDlpPath, let ffmpegPath else { return }
         let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
@@ -768,6 +963,7 @@ final class CompressorModel: ObservableObject {
                     self.youtubeDownloadProgress = 1
                     self.youtubeDownloadStatus = "Download complete in \(Int(self.youtubeDownloadElapsed))s."
                     self.youtubeURLText = ""
+                    self.scheduleYoutubePreviewFetch()
                     self.setInput(newFile)
                 } else {
                     let lastLine = self.youtubeDownloadLog
@@ -1016,10 +1212,12 @@ struct FFmpegPlan {
 struct PlainTextField: NSViewRepresentable {
     let placeholder: String
     @Binding var text: String
+    var fontSize: CGFloat = 13
 
-    init(_ placeholder: String, text: Binding<String>) {
+    init(_ placeholder: String, text: Binding<String>, fontSize: CGFloat = 13) {
         self.placeholder = placeholder
         self._text = text
+        self.fontSize = fontSize
     }
 
     func makeNSView(context: Context) -> NSTextField {
@@ -1027,6 +1225,7 @@ struct PlainTextField: NSViewRepresentable {
         field.placeholderString = placeholder
         field.delegate = context.coordinator
         field.bezelStyle = .roundedBezel
+        field.font = NSFont.systemFont(ofSize: fontSize)
         return field
     }
 
@@ -1081,101 +1280,54 @@ enum ToolLocator {
     }
 }
 
+struct SettingsCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            content
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = CompressorModel()
     @State private var isDropTargeted = false
+    @State private var columnVisibility = NavigationSplitViewVisibility.all
+    @State private var showInspector = true
 
     var body: some View {
-        HStack(spacing: 0) {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             sourceSidebar
-            Divider()
-            settingsPane
-        }
-        .frame(minWidth: 860, idealWidth: 940, minHeight: 610)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    private var sourceSidebar: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 4) {
-                Label("Squishy", systemImage: "arrow.down.and.line.horizontal.and.arrow.up")
-                    .font(.title2.weight(.semibold))
-                Text("Compress and convert with local ffmpeg.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-
-            dropZone
-
-            youtubeSection
-
-            metadataSection
-
-            Spacer(minLength: 12)
-
-            statusSection
-        }
-        .padding(22)
-        .frame(width: 330)
-        .background(SidebarBackground())
-    }
-
-    private var settingsPane: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text("Export Settings")
-                    .font(.title2.weight(.semibold))
-                Spacer()
-                Button {
-                    model.chooseOutput()
-                } label: {
-                    Label("Save As", systemImage: "square.and.pencil")
+                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 360)
+        } detail: {
+            contentColumn
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            showInspector.toggle()
+                        } label: {
+                            Label("Export Settings", systemImage: "slider.horizontal.3")
+                        }
+                        .labelStyle(.iconOnly)
+                    }
                 }
-                .disabled(model.inputURL == nil || model.jobState == .running)
-            }
-
-            settingsForm
-
-            Spacer(minLength: 10)
-
-            actionBar
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    private var dropZone: some View {
-        Button {
-            model.chooseInput()
-        } label: {
-            VStack(spacing: 12) {
-                Image(systemName: model.inputURL == nil ? "plus.rectangle.on.folder" : "checkmark.circle.fill")
-                    .font(.system(size: 34, weight: .medium))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(model.inputURL == nil ? Color.accentColor : .green)
-
-                Text(model.inputURL?.lastPathComponent ?? "Drop media here")
-                    .font(.headline)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-
-                Text(model.inputURL == nil ? "or click to choose a file" : "Click to choose another source")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 158)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isDropTargeted ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(isDropTargeted ? Color.accentColor : Color(nsColor: .separatorColor), style: StrokeStyle(lineWidth: 1.2, dash: [6, 5]))
-            )
+        .inspector(isPresented: $showInspector) {
+            exportSettingsInspector
+                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
         }
-        .buttonStyle(.plain)
+        .navigationTitle("Squishy")
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.accentColor, lineWidth: 2)
+                .opacity(isDropTargeted ? 1 : 0)
+                .padding(4)
+                .allowsHitTesting(false)
+        )
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             guard let provider = providers.first else { return false }
             provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
@@ -1188,13 +1340,151 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Column 1: Source
+
+    private var sourceSidebar: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    SettingsCard { dropZone }
+                    SettingsCard { youtubeSection }
+                }
+                .padding(16)
+            }
+
+            Divider()
+
+            SettingsCard { consoleLogSection }
+                .padding(16)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var consoleLogSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(model.ffmpegStatus, systemImage: model.ffmpegStatus == "ffmpeg not found" ? "exclamationmark.triangle.fill" : "terminal")
+                .font(.caption)
+                .foregroundStyle(model.ffmpegStatus == "ffmpeg not found" ? .red : .secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            ScrollView {
+                Text(model.ffmpegLog)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .frame(height: 90)
+        }
+    }
+
+    @ViewBuilder
+    private var dropZone: some View {
+        if model.inputURL == nil {
+            Button {
+                model.chooseInput()
+            } label: {
+                VStack(spacing: 10) {
+                    Image(systemName: "plus.rectangle.on.folder")
+                        .font(.system(size: 30, weight: .medium))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(Color.accentColor)
+
+                    Text("Drop media here")
+                        .font(.headline)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+
+                    Text("or click to choose a file")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color(nsColor: .controlBackgroundColor))
+
+                        if let thumbnail = model.thumbnail {
+                            Image(nsImage: thumbnail)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        } else {
+                            Image(systemName: model.inputKind == .image ? "photo" : "film")
+                                .font(.system(size: 22, weight: .light))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.inputURL!.lastPathComponent)
+                            .font(.headline)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+
+                        Text([model.metadata?.videoCodec?.uppercased(), model.fileSizeText].compactMap { $0 }.joined(separator: " · "))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        model.chooseInput()
+                    } label: {
+                        Label("Choose Another", systemImage: "plus.rectangle.on.folder")
+                    }
+                    .controlSize(.small)
+
+                    Button(role: .destructive) {
+                        model.clearInput()
+                    } label: {
+                        Label("Remove", systemImage: "xmark.circle")
+                    }
+                    .controlSize(.small)
+
+                    Spacer(minLength: 0)
+                }
+
+                if model.isLoadingSource {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
     private var youtubeSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("YouTube Link", symbol: "play.rectangle")
+            HStack(spacing: 10) {
+                PlainTextField("Paste a YouTube URL", text: $model.youtubeURLText, fontSize: 13)
+                    .disabled(model.isDownloadingYouTube)
+                    .onChange(of: model.youtubeURLText) { _ in
+                        model.scheduleYoutubePreviewFetch()
+                    }
 
-            PlainTextField("Paste a YouTube URL", text: $model.youtubeURLText)
-                .disabled(model.isDownloadingYouTube)
-                .frame(height: 22)
+                Button {
+                    model.downloadYouTube()
+                } label: {
+                    Label(model.isDownloadingYouTube ? "Downloading..." : "Download", systemImage: "arrow.down.circle")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(!model.canDownloadYouTube)
+            }
 
             if let hint = model.youtubeURLValidationHint {
                 Text(hint)
@@ -1203,36 +1493,42 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if model.isFetchingYoutubePreview {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Fetching video info...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if model.youtubePreviewTitle != nil {
+                youtubePreviewCard
+            }
+
             Picker("Download as", selection: $model.youtubeKind) {
                 ForEach(YouTubeDownloadKind.allCases) { kind in
                     Text(kind.title).tag(kind)
                 }
             }
-            .labelsHidden()
             .pickerStyle(.segmented)
             .disabled(model.isDownloadingYouTube)
 
-            HStack(spacing: 10) {
-                Button {
-                    model.downloadYouTube()
-                } label: {
-                    Label(model.isDownloadingYouTube ? "Downloading..." : "Download", systemImage: "arrow.down.circle")
-                }
-                .disabled(!model.canDownloadYouTube)
-
-                if model.isDownloadingYouTube {
-                    Button("Cancel", role: .destructive) {
-                        model.cancelYouTubeDownload()
+            if model.isDownloadingYouTube || model.isYtDlpOutdated {
+                HStack(spacing: 10) {
+                    if model.isDownloadingYouTube {
+                        Button("Cancel", role: .destructive) {
+                            model.cancelYouTubeDownload()
+                        }
                     }
-                }
 
-                if model.isYtDlpOutdated {
-                    Button {
-                        model.updateYtDlp()
-                    } label: {
-                        Label(model.isUpdatingYtDlp ? "Updating..." : "Update yt-dlp", systemImage: "arrow.triangle.2.circlepath")
+                    if model.isYtDlpOutdated {
+                        Button {
+                            model.updateYtDlp()
+                        } label: {
+                            Label(model.isUpdatingYtDlp ? "Updating..." : "Update yt-dlp", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(model.isUpdatingYtDlp)
                     }
-                    .disabled(model.isUpdatingYtDlp)
                 }
             }
 
@@ -1258,9 +1554,8 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(6)
                 }
-                .frame(height: 90)
-                .background(Color.black.opacity(0.25))
-                .cornerRadius(6)
+                .frame(height: 80)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
 
             if model.isUpdatingYtDlp {
@@ -1283,9 +1578,8 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(6)
                 }
-                .frame(height: 90)
-                .background(Color.black.opacity(0.25))
-                .cornerRadius(6)
+                .frame(height: 80)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
         }
         .alert("yt-dlp Update Available", isPresented: $model.showYtDlpUpdateAlert) {
@@ -1298,138 +1592,136 @@ struct ContentView: View {
         }
     }
 
-    private var metadataSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("Source", symbol: "info.circle")
+    private var youtubePreviewCard: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
 
-            if let metadata = model.metadata {
-                if model.inputKind == .image {
-                    InfoRow(symbol: "photo", title: "Image", value: metadata.videoText)
+                if let thumbnail = model.youtubePreviewThumbnail {
+                    Image(nsImage: thumbnail)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 } else {
-                    InfoRow(symbol: "clock", title: "Duration", value: metadata.durationText)
-                    InfoRow(symbol: "film", title: "Video", value: metadata.videoText)
-                    InfoRow(symbol: "waveform", title: "Audio", value: metadata.audioText)
+                    Image(systemName: "play.rectangle")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 74, height: 42)
+            .clipped()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.youtubePreviewTitle ?? "")
+                    .font(.callout.weight(.medium))
+                    .lineLimit(2)
+
+                if let duration = model.youtubePreviewDuration {
+                    Text(youtubePreviewDurationText(duration))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func youtubePreviewDurationText(_ duration: Double) -> String {
+        let total = Int(duration.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    // MARK: - Column 2: Content
+
+    private var contentColumn: some View {
+        Group {
+            if model.inputURL != nil {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        previewHeader
+                        SettingsCard { fileInfoSection }
+                    }
+                    .padding(20)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
-                Text("No source selected.")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                ContentUnavailableView {
+                    Label("No Source Selected", systemImage: "film")
+                } description: {
+                    Text("Choose or drop a media file in the sidebar to get started.")
+                }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var statusSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("Status", symbol: "dot.radiowaves.left.and.right")
+    private var previewHeader: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
 
-            Label(model.ffmpegStatus, systemImage: model.ffmpegStatus == "ffmpeg not found" ? "exclamationmark.triangle.fill" : "terminal")
-                .font(.caption)
-                .foregroundStyle(model.ffmpegStatus == "ffmpeg not found" ? .red : .secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            ProgressView(value: model.progress)
-                .opacity(model.jobState == .idle ? 0.35 : 1)
-
-            Text(model.ffmpegLog)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(5)
-                .frame(maxWidth: .infinity, minHeight: 58, alignment: .topLeading)
-                .padding(10)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-    }
-
-    private var settingsForm: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            FormRow("Format") {
-                Picker("Format", selection: $model.settings.format) {
-                    ForEach(OutputFormat.allCases.filter { $0.isImage == (model.inputKind == .image) }) { format in
-                        Text(format.title).tag(format)
-                    }
+                if let thumbnail = model.thumbnail {
+                    Image(nsImage: thumbnail)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .padding(4)
+                } else {
+                    Image(systemName: model.inputKind == .image ? "photo" : "film")
+                        .font(.system(size: 40, weight: .light))
+                        .foregroundStyle(.secondary)
                 }
-                .labelsHidden()
-                .onChange(of: model.settings.format) { _ in
-                    model.normalizeSettingsAfterFormatChange()
-                }
-
-                Text(model.settings.format.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
+            .frame(height: 220)
+            .frame(maxWidth: .infinity)
 
-            FormRow("Resolution") {
-                Picker("Resolution", selection: $model.settings.resolution) {
-                    ForEach(ResolutionOption.allCases) { option in
-                        Text(option.title).tag(option)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .disabled(model.settings.format.isAudioOnly || model.jobState == .running)
-            }
-
-            FormRow("Output Name") {
-                TextField("Output name", text: $model.settings.outputName)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(model.jobState == .running)
-            }
-
-            FormRow("Destination") {
-                Text(model.outputURL?.path ?? "Choose a source to set the destination.")
-                    .font(.callout)
+            VStack(spacing: 6) {
+                Text(model.inputURL?.lastPathComponent ?? "No file selected")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity)
 
-                Button("Change...") {
-                    model.chooseOutput()
-                }
-                .disabled(model.inputURL == nil || model.jobState == .running)
-            }
-
-            Divider()
-
-            FormRow("Target Size") {
                 HStack(spacing: 8) {
-                    TextField("Optional", text: $model.settings.targetSizeText)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 90)
-                        .disabled(model.jobState == .running || !model.settings.format.supportsTargetSize)
-
-                    Picker("Unit", selection: $model.settings.targetSizeUnit) {
-                        ForEach(SizeUnit.allCases) { unit in
-                            Text(unit.title).tag(unit)
-                        }
+                    if let duration = model.metadata?.duration, duration > 0 {
+                        Text(model.metadata?.durationText ?? "—")
+                        Divider().frame(height: 12)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 100)
-                    .disabled(model.jobState == .running || !model.settings.format.supportsTargetSize)
+                    Text(model.fileSizeText)
                 }
-
-                Text(model.targetSizeNote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            FormRow("Quality") {
-                Slider(value: $model.settings.quality, in: 0...100, step: 1)
-                    .disabled(model.jobState == .running || model.settings.targetSizeKB != nil || !model.settings.format.supportsQuality)
-
-                HStack {
-                    Text("Smaller")
-                    Spacer()
-                    Text("Higher Quality")
-                }
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             }
         }
-        .padding(18)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var fileInfoSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            LabeledContent("Name", value: model.inputURL?.lastPathComponent ?? "—")
+            if let duration = model.metadata?.duration, duration > 0 {
+                LabeledContent("Duration", value: model.metadata?.durationText ?? "—")
+            }
+            if let resolutionText = model.metadata?.resolutionText {
+                LabeledContent("Resolution", value: resolutionText)
+            }
+            LabeledContent("Size", value: model.fileSizeText)
+            LabeledContent("Date Created", value: model.creationDateText)
+            LabeledContent("Format", value: model.settings.format.title)
+
+            if let metadata = model.metadata {
+                Divider()
+                if model.inputKind == .image {
+                    LabeledContent("Image", value: metadata.videoText)
+                } else {
+                    LabeledContent("Video", value: metadata.videoText)
+                    LabeledContent("Audio", value: metadata.audioText)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var actionBar: some View {
@@ -1453,6 +1745,11 @@ struct ContentView: View {
                 }
             }
 
+            if model.jobState == .running {
+                ProgressView(value: model.progress)
+                    .frame(width: 120)
+            }
+
             Button {
                 model.compress()
             } label: {
@@ -1462,7 +1759,6 @@ struct ContentView: View {
             .controlSize(.large)
             .disabled(!model.canRun)
         }
-        .padding(.top, 4)
     }
 
     @ViewBuilder
@@ -1492,86 +1788,107 @@ struct ContentView: View {
             }
         }
     }
-}
 
-struct SidebarBackground: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .sidebar
-        view.blendingMode = .behindWindow
-        view.state = .active
-        return view
-    }
+    // MARK: - Column 3: Export Settings (inspector)
 
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
+    private var exportSettingsInspector: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    SettingsCard {
+                        LabeledContent("Format") {
+                            Picker("", selection: $model.settings.format) {
+                                ForEach(OutputFormat.allCases.filter { $0.isImage == (model.inputKind == .image) }) { format in
+                                    Text(format.title).tag(format)
+                                }
+                            }
+                            .labelsHidden()
+                            .onChange(of: model.settings.format) { _ in
+                                model.normalizeSettingsAfterFormatChange()
+                            }
+                        }
 
-struct SectionHeader: View {
-    let title: String
-    let symbol: String
+                        Text(model.settings.format.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
-    init(_ title: String, symbol: String) {
-        self.title = title
-        self.symbol = symbol
-    }
+                    SettingsCard {
+                        LabeledContent("Resolution") {
+                            Picker("", selection: $model.settings.resolution) {
+                                ForEach(ResolutionOption.allCases) { option in
+                                    Text(option.title).tag(option)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        .disabled(model.settings.format.isAudioOnly || model.jobState == .running)
+                    }
 
-    var body: some View {
-        Label(title, systemImage: symbol)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .textCase(.uppercase)
-    }
-}
+                    SettingsCard {
+                        LabeledContent("Name") {
+                            TextField("Output name", text: $model.settings.outputName)
+                                .multilineTextAlignment(.trailing)
+                                .disabled(model.jobState == .running)
+                        }
 
-struct InfoRow: View {
-    let symbol: String
-    let title: String
-    let value: String
+                        Divider()
 
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: symbol)
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
+                        Text(model.outputURL?.path ?? "Choose a source to set the destination.")
+                            .font(.callout)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .foregroundStyle(.secondary)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(value)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
+                        Button("Change...") {
+                            model.chooseOutput()
+                        }
+                        .disabled(model.inputURL == nil || model.jobState == .running)
+                    }
 
-struct FormRow<Content: View>: View {
-    let title: String
-    let content: Content
+                    SettingsCard {
+                        LabeledContent("Target Size (Optional)") {
+                            TextField("e.g. 25", text: $model.settings.targetSizeText)
+                                .multilineTextAlignment(.trailing)
+                                .frame(width: 70)
+                                .disabled(model.jobState == .running || !model.settings.format.supportsTargetSize)
 
-    init(_ title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
+                            Picker("Unit", selection: $model.settings.targetSizeUnit) {
+                                ForEach(SizeUnit.allCases) { unit in
+                                    Text(unit.title).tag(unit)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(width: 100)
+                            .disabled(model.jobState == .running || !model.settings.format.supportsTargetSize)
+                        }
 
-    var body: some View {
-        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 18, verticalSpacing: 6) {
-            GridRow {
-                Text(title)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 110, alignment: .trailing)
+                        Text(model.targetSizeNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    content
+                    SettingsCard {
+                        HStack {
+                            Text("Quality")
+                            Spacer()
+                            Text("\(Int(model.settings.quality))%")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+
+                        Slider(value: $model.settings.quality, in: 0...100, step: 1)
+                            .disabled(model.jobState == .running || model.settings.targetSizeKB != nil || !model.settings.format.supportsQuality)
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
             }
+
+            Divider()
+
+            actionBar
+                .padding(16)
         }
     }
 }
@@ -1582,7 +1899,7 @@ struct SquishyApp: App {
         WindowGroup {
             ContentView()
         }
-        .windowStyle(.titleBar)
+        .defaultSize(width: 980, height: 640)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }

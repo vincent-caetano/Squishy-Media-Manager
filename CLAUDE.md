@@ -10,6 +10,16 @@ https://developer.apple.com/design/human-interface-guidelines/components
 
 When building or modifying SwiftUI views, prefer native macOS components and standard interaction patterns described there over custom controls.
 
+### Component sources
+
+There is no fetchable "macOS UI component library" package — native controls ship with SwiftUI/AppKit in the SDK already (`Button`, `Picker`, `Toggle`, `Slider`, `Form`, `NavigationSplitView`, `Table`, etc.). Use these references when implementing or reviewing UI:
+
+- Apple HIG components: https://developer.apple.com/design/human-interface-guidelines/components
+- SwiftUIX (extra SwiftUI controls/utilities, use sparingly and only when no native equivalent exists): https://github.com/SwiftUIX/SwiftUIX
+- ExploreSwiftUI (SwiftUI component examples/patterns): https://exploreswiftui.com/
+
+Prefer plain native SwiftUI first; only reach for SwiftUIX when it fills a genuine gap, since third-party controls can drift from native HIG look-and-feel.
+
 ## Build
 
 ```sh
