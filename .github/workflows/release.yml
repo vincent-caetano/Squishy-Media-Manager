@@ -1,0 +1,71 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-26
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify release version
+        run: |
+          app_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+          if [[ "v${app_version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Info.plist version ${app_version}."
+            exit 1
+          fi
+
+      - name: Build app
+        run: ./build.sh
+
+      - name: Sign and verify app
+        run: |
+          codesign --force --deep --sign - build/Squishy.app
+          codesign --verify --deep --strict --verbose=2 build/Squishy.app
+          file build/Squishy.app/Contents/MacOS/Squishy | grep -q "arm64"
+          plutil -lint build/Squishy.app/Contents/Info.plist
+
+      - name: Package release assets
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dmg_name="Squishy-macOS-arm64-v${version}.dmg"
+          zip_name="Squishy-macOS-arm64-v${version}.zip"
+
+          mkdir -p dist build/dmg-root
+          ditto build/Squishy.app build/dmg-root/Squishy.app
+          ln -s /Applications build/dmg-root/Applications
+
+          hdiutil create \
+            -volname "Squishy" \
+            -srcfolder build/dmg-root \
+            -ov \
+            -format UDZO \
+            "dist/${dmg_name}"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/Squishy.app \
+            "dist/${zip_name}"
+
+          cd dist
+          shasum -a 256 "${dmg_name}" "${zip_name}" > SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/Squishy-macOS-arm64-"${GITHUB_REF_NAME}".dmg \
+            dist/Squishy-macOS-arm64-"${GITHUB_REF_NAME}".zip \
+            dist/SHA256SUMS.txt \
+            --verify-tag \
+            --title "Squishy ${GITHUB_REF_NAME}" \
+            --notes "Adds guided first-run setup and verification for Homebrew, FFmpeg, ffprobe, and yt-dlp. Squishy can now install required media tools through Homebrew, display installation progress, and recover when a dependency is missing."
