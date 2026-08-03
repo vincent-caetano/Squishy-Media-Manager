@@ -181,6 +181,13 @@ enum JobState: Equatable {
     case failed(String)
 }
 
+enum PrerequisiteInstallState: Equatable {
+    case idle
+    case installing
+    case succeeded
+    case failed(String)
+}
+
 @MainActor
 final class CompressorModel: ObservableObject {
     @Published var inputURL: URL?
@@ -225,15 +232,133 @@ final class CompressorModel: ObservableObject {
     private var youtubeProcess: Process?
     private var ytDlpUpdateProcess: Process?
     private var ytDlpUpdateTimer: Timer?
-    private let ffmpegPath = ToolLocator.find("ffmpeg")
-    private let ffprobePath = ToolLocator.find("ffprobe")
-    private let ytDlpPath = ToolLocator.find("yt-dlp")
-    private let brewPath = ToolLocator.find("brew")
+    private var prerequisiteInstallProcess: Process?
+
+    @Published private(set) var ffmpegPath: String?
+    @Published private(set) var ffprobePath: String?
+    @Published private(set) var ytDlpPath: String?
+    @Published private(set) var brewPath: String?
+    @Published private(set) var ffmpegVersion: String?
+    @Published private(set) var ytDlpVersion: String?
+    @Published private(set) var brewVersion: String?
+    @Published var prerequisiteInstallState: PrerequisiteInstallState = .idle
+    @Published var prerequisiteInstallLog = ""
 
     private static let ytDlpUpdateExpectedSeconds: TimeInterval = 20
 
     init() {
+        refreshPrerequisites()
         checkYtDlpFreshness()
+    }
+
+    var prerequisitesReady: Bool {
+        ffmpegPath != nil && ffprobePath != nil && ytDlpPath != nil
+    }
+
+    var isInstallingPrerequisites: Bool {
+        prerequisiteInstallState == .installing
+    }
+
+    func refreshPrerequisites() {
+        let locatedBrewPath = ToolLocator.find("brew")
+        let locatedFFmpegPath = ToolLocator.find("ffmpeg")
+        let locatedFFprobePath = ToolLocator.find("ffprobe")
+        let locatedYtDlpPath = ToolLocator.find("yt-dlp")
+
+        let detectedBrewVersion = locatedBrewPath.flatMap {
+            ToolLocator.version(at: $0, arguments: ["--version"])
+        }
+        let detectedFFmpegVersion = locatedFFmpegPath.flatMap {
+            ToolLocator.version(at: $0, arguments: ["-version"])
+        }
+        let detectedFFprobeVersion = locatedFFprobePath.flatMap {
+            ToolLocator.version(at: $0, arguments: ["-version"])
+        }
+        let detectedYtDlpVersion = locatedYtDlpPath.flatMap {
+            ToolLocator.version(at: $0, arguments: ["--version"])
+        }
+
+        brewPath = detectedBrewVersion == nil ? nil : locatedBrewPath
+        ffmpegPath = detectedFFmpegVersion == nil ? nil : locatedFFmpegPath
+        ffprobePath = detectedFFprobeVersion == nil ? nil : locatedFFprobePath
+        ytDlpPath = detectedYtDlpVersion == nil ? nil : locatedYtDlpPath
+        brewVersion = detectedBrewVersion
+        ffmpegVersion = detectedFFmpegVersion
+        ytDlpVersion = detectedYtDlpVersion
+
+        if ytDlpPath == nil {
+            isYtDlpOutdated = false
+        }
+        if prerequisitesReady && !isInstallingPrerequisites,
+           case .failed = prerequisiteInstallState {
+            prerequisiteInstallState = .succeeded
+        }
+    }
+
+    func installPrerequisites() {
+        guard let brewPath else {
+            prerequisiteInstallState = .failed("Homebrew must be installed before Squishy can install its media tools.")
+            return
+        }
+        guard !isInstallingPrerequisites else { return }
+
+        prerequisiteInstallState = .installing
+        prerequisiteInstallLog = "$ brew install ffmpeg yt-dlp\n"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: brewPath)
+        process.arguments = ["install", "ffmpeg", "yt-dlp"]
+
+        var environment = ProcessInfo.processInfo.environment
+        let existingPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["PATH"] = ([
+            (brewPath as NSString).deletingLastPathComponent,
+            "/opt/homebrew/bin",
+            "/usr/local/bin"
+        ] + [existingPath]).joined(separator: ":")
+        process.environment = environment
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+        prerequisiteInstallProcess = process
+
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                self?.prerequisiteInstallLog += text
+            }
+        }
+
+        process.terminationHandler = { [weak self] terminatedProcess in
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.prerequisiteInstallProcess = nil
+                self.refreshPrerequisites()
+
+                if terminatedProcess.terminationStatus == 0 && self.prerequisitesReady {
+                    self.prerequisiteInstallState = .succeeded
+                    self.prerequisiteInstallLog += "\nVerification passed. Squishy is ready.\n"
+                    self.checkYtDlpFreshness()
+                } else if terminatedProcess.terminationStatus == 0 {
+                    self.prerequisiteInstallState = .failed("Homebrew finished, but one or more tools could not be verified. Check the log and try again.")
+                } else {
+                    self.prerequisiteInstallState = .failed("Homebrew exited with code \(terminatedProcess.terminationStatus). Check the log, then retry.")
+                }
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            prerequisiteInstallProcess = nil
+            prerequisiteInstallState = .failed(error.localizedDescription)
+            prerequisiteInstallLog += "\n\(error.localizedDescription)\n"
+        }
     }
 
     var ffmpegStatus: String {
@@ -355,6 +480,7 @@ final class CompressorModel: ObservableObject {
                 if process.terminationStatus == 0 {
                     self.isYtDlpOutdated = false
                     self.ytDlpUpdateMessage = "yt-dlp updated successfully in \(Int(self.ytDlpUpdateElapsed))s."
+                    self.refreshPrerequisites()
                     self.checkYtDlpFreshness()
                 } else {
                     self.ytDlpUpdateMessage = "Update failed. Try running 'brew upgrade yt-dlp' manually."
@@ -1266,17 +1392,55 @@ struct PlainTextField: NSViewRepresentable {
 
 enum ToolLocator {
     static func find(_ name: String) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let pathCandidates = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map { "\($0)/\(name)" }
         let candidates = [
             "/opt/homebrew/bin/\(name)",
             "/usr/local/bin/\(name)",
-            "/usr/bin/\(name)"
-        ]
+            "/usr/bin/\(name)",
+            "/opt/local/bin/\(name)",
+            "\(home)/.local/bin/\(name)",
+            "\(home)/.nix-profile/bin/\(name)",
+            "/run/current-system/sw/bin/\(name)",
+            "/opt/homebrew/opt/\(name)/bin/\(name)",
+            "/usr/local/opt/\(name)/bin/\(name)"
+        ] + pathCandidates
 
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return path
+        var visited = Set<String>()
+        for path in candidates {
+            guard visited.insert(path).inserted else { continue }
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
         }
 
         return nil
+    }
+
+    static func version(at path: String, arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .split(separator: "\n", maxSplits: 1)
+            .first
+            .map(String.init)
     }
 }
 
@@ -1293,11 +1457,251 @@ struct SettingsCard<Content: View>: View {
     }
 }
 
+struct PrerequisiteOnboardingView: View {
+    @ObservedObject var model: CompressorModel
+    let isRecovery: Bool
+    let onComplete: () -> Void
+
+    private let homebrewInstallCommand = "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    header
+                    prerequisiteStep(
+                        number: 1,
+                        title: "Homebrew",
+                        detail: "Homebrew securely manages the command-line tools Squishy depends on."
+                    ) {
+                        homebrewContent
+                    }
+                    prerequisiteStep(
+                        number: 2,
+                        title: "Media tools",
+                        detail: "FFmpeg handles media conversion, while yt-dlp enables YouTube downloads."
+                    ) {
+                        mediaToolsContent
+                    }
+                    prerequisiteStep(
+                        number: 3,
+                        title: "Verification",
+                        detail: "Squishy launches each tool and checks that it responds before setup can finish."
+                    ) {
+                        verificationContent
+                    }
+                }
+                .padding(28)
+            }
+
+            Divider()
+
+            HStack {
+                if model.brewPath != nil && !model.prerequisitesReady {
+                    Button("Verify Again") {
+                        model.refreshPrerequisites()
+                    }
+                    .disabled(model.isInstallingPrerequisites)
+                }
+
+                Spacer()
+
+                Button("Start Using Squishy") {
+                    onComplete()
+                }
+                .keyboardShortcut(.defaultAction)
+                .controlSize(.large)
+                .disabled(!model.prerequisitesReady || model.isInstallingPrerequisites)
+            }
+            .padding(20)
+        }
+        .frame(width: 650, height: 640)
+        .interactiveDismissDisabled(!model.prerequisitesReady)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 18) {
+            Image(systemName: model.prerequisitesReady ? "checkmark.seal.fill" : "wand.and.stars")
+                .font(.system(size: 42, weight: .medium))
+                .foregroundStyle(model.prerequisitesReady ? .green : Color.accentColor)
+                .symbolRenderingMode(.hierarchical)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(model.prerequisitesReady ? "Squishy is ready" : (isRecovery ? "Squishy needs a quick check" : "Welcome to Squishy"))
+                    .font(.largeTitle.bold())
+
+                Text(model.prerequisitesReady
+                     ? "All required tools are installed and responding correctly."
+                     : "Complete these three steps once, then Squishy will be ready to compress and download media.")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func prerequisiteStep<Content: View>(
+        number: Int,
+        title: String,
+        detail: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Text("\(number)")
+                .font(.headline)
+                .frame(width: 30, height: 30)
+                .background(Color.accentColor.opacity(0.15), in: Circle())
+                .foregroundStyle(Color.accentColor)
+
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.headline)
+                    Text(detail)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var homebrewContent: some View {
+        if let brewPath = model.brewPath {
+            requirementRow(
+                title: "Homebrew",
+                detail: model.brewVersion ?? brewPath,
+                isReady: true
+            )
+        } else if model.prerequisitesReady {
+            requirementRow(
+                title: "Homebrew not required",
+                detail: "The required tools were found through another package manager.",
+                isReady: true
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Homebrew was not found", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+
+                Text("Open Terminal, paste this official installation command, and follow its prompts:")
+                    .font(.callout)
+
+                Text(homebrewInstallCommand)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+
+                HStack {
+                    Button("Copy Command") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(homebrewInstallCommand, forType: .string)
+                    }
+                    Button("Open Terminal") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+                    }
+                    Button("Check Again") {
+                        model.refreshPrerequisites()
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var mediaToolsContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            requirementRow(
+                title: "FFmpeg and ffprobe",
+                detail: model.ffmpegVersion ?? "Not installed or not responding",
+                isReady: model.ffmpegPath != nil && model.ffprobePath != nil
+            )
+            requirementRow(
+                title: "yt-dlp",
+                detail: model.ytDlpVersion ?? "Not installed or not responding",
+                isReady: model.ytDlpPath != nil
+            )
+
+            if model.brewPath != nil && !model.prerequisitesReady {
+                Button {
+                    model.installPrerequisites()
+                } label: {
+                    Label(model.isInstallingPrerequisites ? "Installing…" : "Install Required Tools", systemImage: "arrow.down.circle")
+                }
+                .controlSize(.large)
+                .disabled(model.isInstallingPrerequisites)
+            }
+
+            if model.isInstallingPrerequisites {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
+
+            if !model.prerequisiteInstallLog.isEmpty {
+                ScrollView {
+                    Text(model.prerequisiteInstallLog)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .padding(8)
+                }
+                .frame(height: 90)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+            }
+
+            if case let .failed(message) = model.prerequisiteInstallState {
+                Label(message, systemImage: "xmark.octagon.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var verificationContent: some View {
+        requirementRow(
+            title: model.prerequisitesReady ? "All checks passed" : "Waiting for required tools",
+            detail: model.prerequisitesReady
+                ? "Compression and YouTube downloads are enabled."
+                : "Install the missing items above, then run verification again.",
+            isReady: model.prerequisitesReady
+        )
+    }
+
+    private func requirementRow(title: String, detail: String, isReady: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: isReady ? "checkmark.circle.fill" : "circle.dashed")
+                .foregroundStyle(isReady ? .green : .secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = CompressorModel()
+    @AppStorage("hasCompletedPrerequisiteOnboarding") private var hasCompletedPrerequisiteOnboarding = false
     @State private var isDropTargeted = false
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var showInspector = true
+    @State private var showPrerequisiteOnboarding = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -1338,6 +1742,20 @@ struct ContentView: View {
             }
             return true
         }
+        .onAppear {
+            model.refreshPrerequisites()
+            showPrerequisiteOnboarding = !hasCompletedPrerequisiteOnboarding || !model.prerequisitesReady
+        }
+        .sheet(isPresented: $showPrerequisiteOnboarding) {
+            PrerequisiteOnboardingView(
+                model: model,
+                isRecovery: hasCompletedPrerequisiteOnboarding,
+                onComplete: {
+                    hasCompletedPrerequisiteOnboarding = true
+                    showPrerequisiteOnboarding = false
+                }
+            )
+        }
     }
 
     // MARK: - Column 1: Source
@@ -1367,6 +1785,12 @@ struct ContentView: View {
                 .foregroundStyle(model.ffmpegStatus == "ffmpeg not found" ? .red : .secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            Button("Check Requirements…") {
+                model.refreshPrerequisites()
+                showPrerequisiteOnboarding = true
+            }
+            .controlSize(.small)
 
             ScrollView {
                 Text(model.ffmpegLog)
