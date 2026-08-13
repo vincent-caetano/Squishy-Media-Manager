@@ -62,10 +62,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes_file="release-notes/${GITHUB_REF_NAME}.md"
+          if [[ -f "${notes_file}" ]]; then
+            notes_args=(--notes-file "${notes_file}")
+          else
+            notes_args=(--generate-notes)
+          fi
+
           gh release create "${GITHUB_REF_NAME}" \
             dist/Squishy-macOS-arm64-"${GITHUB_REF_NAME}".dmg \
             dist/Squishy-macOS-arm64-"${GITHUB_REF_NAME}".zip \
             dist/SHA256SUMS.txt \
             --verify-tag \
             --title "Squishy ${GITHUB_REF_NAME}" \
-            --notes "Adds guided first-run setup and verification for Homebrew, FFmpeg, ffprobe, and yt-dlp. Squishy can now install required media tools through Homebrew, display installation progress, and recover when a dependency is missing."
+            "${notes_args[@]}"
