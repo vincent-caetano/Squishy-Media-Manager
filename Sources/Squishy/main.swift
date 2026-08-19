@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import ImageIO
+import CryptoKit
 
 enum OutputFormat: String, CaseIterable, Identifiable {
     case mp4H264
@@ -85,6 +86,13 @@ enum OutputFormat: String, CaseIterable, Identifiable {
 enum SourceKind {
     case video
     case image
+}
+
+/// Holds the drained output of a process' pipes; each field is written once by a
+/// single background reader before the termination handler joins on them.
+final class PipeCollector: @unchecked Sendable {
+    var output = Data()
+    var error = Data()
 }
 
 enum YouTubeDownloadKind: String, CaseIterable, Identifiable {
@@ -338,6 +346,7 @@ final class CompressorModel: ObservableObject {
     @Published var youtubePreviewTitle: String?
     @Published var youtubePreviewDuration: Double?
     @Published var youtubePreviewThumbnail: NSImage?
+    @Published var youtubePreviewError: String?
 
     private var youtubeDownloadTimer: Timer?
     private var youtubePreviewDebounceTimer: Timer?
@@ -349,6 +358,15 @@ final class CompressorModel: ObservableObject {
     @Published var updateAlertMessage = ""
     @Published var updateDownloadURL: URL?
     @Published var isCheckingForUpdates = false
+
+    @Published var availableRelease: UpdateChecker.Release?
+    @Published var showUpdateInstaller = false
+    @Published var isInstallingUpdate = false
+    @Published var updateInstallProgress: Double = 0
+    @Published var updateInstallStatus = ""
+    @Published var updateInstallError: String?
+    private var updateDownloadTask: URLSessionDownloadTask?
+    private var updateProgressObservation: NSKeyValueObservation?
 
     @Published var isYtDlpOutdated = false
     @Published var isUpdatingYtDlp = false
@@ -517,11 +535,15 @@ final class CompressorModel: ObservableObject {
                 case let .success(release):
                     if UpdateChecker.isVersion(release.version, newerThan: self.appVersion) {
                         self.updateAlertTitle = "Update Available"
-                        self.updateAlertMessage = "Squishy \(release.version) is available. You're running \(self.appVersion). Download the new version and drag it into Applications, replacing the old copy."
+                        self.availableRelease = release
+                        self.updateAlertMessage = release.canInstallInPlace
+                            ? "Squishy \(release.version) is available. You're running \(self.appVersion). Squishy can download and install it for you, then relaunch."
+                            : "Squishy \(release.version) is available. You're running \(self.appVersion). Download the new version and drag it into Applications, replacing the old copy."
                         self.updateDownloadURL = release.pageURL
                         self.showUpdateAlert = true
                         self.log("Update available: \(release.version) (running \(self.appVersion)).")
                     } else if userInitiated {
+                        self.availableRelease = nil
                         self.updateAlertTitle = "You're Up to Date"
                         self.updateAlertMessage = "Squishy \(self.appVersion) is the latest version."
                         self.updateDownloadURL = nil
@@ -540,6 +562,279 @@ final class CompressorModel: ObservableObject {
         }
     }
 
+    // MARK: - In-place update
+
+    /// Where the running bundle lives. The installer replaces this directory.
+    private var installedBundleURL: URL { Bundle.main.bundleURL }
+
+    /// Squishy can only replace itself if it can write to its own containing folder —
+    /// not the case when it is still running from a mounted disk image.
+    var canInstallUpdateInPlace: Bool {
+        guard let release = availableRelease, release.canInstallInPlace else { return false }
+        let parent = installedBundleURL.deletingLastPathComponent()
+        return FileManager.default.isWritableFile(atPath: parent.path)
+    }
+
+    var updateBlockedReason: String? {
+        guard let release = availableRelease else { return "No update is available." }
+        guard release.canInstallInPlace else {
+            return "This release doesn't publish the assets Squishy needs to install itself. Use Download Page instead."
+        }
+        let parent = installedBundleURL.deletingLastPathComponent()
+        guard FileManager.default.isWritableFile(atPath: parent.path) else {
+            return "Squishy can't write to \(parent.path). Drag it into Applications first, or use Download Page."
+        }
+        return nil
+    }
+
+    func installUpdate() {
+        guard let release = availableRelease,
+              let zipName = release.zipName,
+              let zipURL = release.zipURL,
+              let checksumsURL = release.checksumsURL,
+              !isInstallingUpdate else { return }
+
+        if let reason = updateBlockedReason {
+            updateInstallError = reason
+            return
+        }
+
+        isInstallingUpdate = true
+        updateInstallProgress = 0
+        updateInstallError = nil
+        updateInstallStatus = "Fetching checksums…"
+        log("Installing Squishy \(release.version)…")
+
+        // The checksums file is a few hundred bytes; fetch it first so a mismatch is
+        // caught before spending bandwidth on the build.
+        URLSession.shared.dataTask(with: checksumsURL) { [weak self] data, _, error in
+            guard let self else { return }
+
+            guard let data, error == nil,
+                  let text = String(data: data, encoding: .utf8),
+                  let expected = Self.expectedChecksum(for: zipName, in: text) else {
+                DispatchQueue.main.async {
+                    self.failUpdate("Could not read SHA256SUMS.txt for this release.")
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.updateInstallStatus = "Downloading Squishy \(release.version)…"
+                self.downloadUpdate(from: zipURL, expecting: expected, version: release.version)
+            }
+        }.resume()
+    }
+
+    /// Pulls the `<hash>  <filename>` line for one asset out of a `shasum -a 256` listing.
+    nonisolated static func expectedChecksum(for fileName: String, in listing: String) -> String? {
+        for line in listing.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard parts.count >= 2, parts.last == fileName else { continue }
+            return parts[0].lowercased()
+        }
+        return nil
+    }
+
+    private func downloadUpdate(from url: URL, expecting checksum: String, version: String) {
+        let task = URLSession.shared.downloadTask(with: url) { [weak self] location, _, error in
+            guard let self else { return }
+
+            guard let location, error == nil else {
+                DispatchQueue.main.async {
+                    self.failUpdate(error?.localizedDescription ?? "Download failed.")
+                }
+                return
+            }
+
+            // The temporary file is deleted as soon as this handler returns, so move it first.
+            let staging = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SquishyUpdate-\(UUID().uuidString)", isDirectory: true)
+            let archive = staging.appendingPathComponent("Squishy.zip")
+            do {
+                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: location, to: archive)
+            } catch {
+                DispatchQueue.main.async {
+                    self.failUpdate("Could not stage the download: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.updateInstallProgress = 1
+                self.updateInstallStatus = "Verifying…"
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.verifyAndStage(archive: archive, staging: staging, checksum: checksum, version: version)
+            }
+        }
+
+        updateProgressObservation = task.progress.observe(\.fractionCompleted) { [weak self] progress, _ in
+            DispatchQueue.main.async {
+                self?.updateInstallProgress = progress.fractionCompleted
+            }
+        }
+
+        updateDownloadTask = task
+        task.resume()
+    }
+
+    nonisolated private func verifyAndStage(archive: URL, staging: URL, checksum: String, version: String) {
+        func fail(_ message: String) {
+            try? FileManager.default.removeItem(at: staging)
+            DispatchQueue.main.async { self.failUpdate(message) }
+        }
+
+        guard let data = try? Data(contentsOf: archive, options: .mappedIfSafe) else {
+            fail("Could not read the downloaded archive.")
+            return
+        }
+
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard digest == checksum else {
+            fail("Checksum mismatch — the download does not match SHA256SUMS.txt. Nothing was installed.")
+            return
+        }
+
+        DispatchQueue.main.async { self.updateInstallStatus = "Unpacking…" }
+
+        let unpacked = staging.appendingPathComponent("unpacked", isDirectory: true)
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-x", "-k", archive.path, unpacked.path]
+        do {
+            try ditto.run()
+            ditto.waitUntilExit()
+        } catch {
+            fail("Could not unpack the download: \(error.localizedDescription)")
+            return
+        }
+        guard ditto.terminationStatus == 0 else {
+            fail("Could not unpack the download (ditto exited \(ditto.terminationStatus)).")
+            return
+        }
+
+        let contents = (try? FileManager.default.contentsOfDirectory(at: unpacked, includingPropertiesForKeys: nil)) ?? []
+        guard let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
+            fail("The downloaded archive did not contain Squishy.app.")
+            return
+        }
+
+        // Strip quarantine so the replacement launches without a Gatekeeper prompt.
+        let xattr = Process()
+        xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        xattr.arguments = ["-dr", "com.apple.quarantine", newApp.path]
+        try? xattr.run()
+        xattr.waitUntilExit()
+
+        DispatchQueue.main.async {
+            self.swapInAndRelaunch(newApp: newApp, staging: staging, version: version)
+        }
+    }
+
+    /// A running bundle cannot replace itself, so a detached script waits for this process
+    /// to exit, swaps the directories, and relaunches.
+    private func swapInAndRelaunch(newApp: URL, staging: URL, version: String) {
+        let target = installedBundleURL
+        // The script and its log live outside the staging directory, because the last
+        // thing the script does is delete that directory — including, otherwise, itself.
+        let scratch = FileManager.default.temporaryDirectory
+        let token = staging.lastPathComponent
+        let script = scratch.appendingPathComponent("\(token).sh")
+        let logPath = scratch.appendingPathComponent("\(token).log").path
+
+        let body = """
+        #!/bin/sh
+        # $1 pid  $2 target bundle  $3 new bundle  $4 staging dir
+        exec >>"\(logPath)" 2>&1
+        set -x
+
+        pid="$1"
+        target="$2"
+        incoming="$3"
+        staging="$4"
+
+        # Squishy has already quit by the time this runs, so every failure has to put
+        # the old copy back on screen rather than leaving the user with nothing.
+        relaunch_and_fail() {
+            open "$target"
+            exit 1
+        }
+
+        while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+        sleep 0.5
+
+        backup="$target.backup-$$"
+        staged="$target.incoming-$$"
+
+        rm -rf "$staged" "$backup"
+        ditto "$incoming" "$staged" || relaunch_and_fail
+        mv "$target" "$backup" || relaunch_and_fail
+        if ! mv "$staged" "$target"; then
+            mv "$backup" "$target"
+            relaunch_and_fail
+        fi
+
+        rm -rf "$backup"
+        open "$target"
+        rm -rf "$staging"
+        """
+
+        do {
+            try body.write(to: script, atomically: true, encoding: .utf8)
+        } catch {
+            failUpdate("Could not write the installer script: \(error.localizedDescription)")
+            return
+        }
+
+        let installer = Process()
+        installer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        installer.arguments = [
+            script.path,
+            String(ProcessInfo.processInfo.processIdentifier),
+            target.path,
+            newApp.path,
+            staging.path
+        ]
+
+        do {
+            try installer.run()
+        } catch {
+            failUpdate("Could not start the installer: \(error.localizedDescription)")
+            return
+        }
+
+        updateInstallStatus = "Installing and relaunching…"
+        log("Quitting to install Squishy \(version).", level: .success)
+
+        // Give the child a moment to reach its wait loop before this process disappears.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func failUpdate(_ message: String) {
+        updateProgressObservation = nil
+        updateDownloadTask = nil
+        isInstallingUpdate = false
+        updateInstallProgress = 0
+        updateInstallStatus = ""
+        updateInstallError = message
+        log("✖ Update failed. \(message)", level: .error)
+    }
+
+    func cancelUpdateInstall() {
+        updateDownloadTask?.cancel()
+        updateProgressObservation = nil
+        updateDownloadTask = nil
+        isInstallingUpdate = false
+        updateInstallProgress = 0
+        updateInstallStatus = ""
+        updateInstallError = nil
+    }
+
     var ffmpegStatus: String {
         guard let ffmpegPath else { return "ffmpeg not found" }
         return ffmpegPath
@@ -548,6 +843,21 @@ final class CompressorModel: ObservableObject {
     var ytDlpStatus: String {
         guard let ytDlpPath else { return "yt-dlp not found" }
         return ytDlpPath
+    }
+
+    /// True as soon as the pasted text is a YouTube link, regardless of whether the
+    /// metadata preview succeeded. The download buttons key off this, not the preview.
+    var hasValidYouTubeURL: Bool {
+        isValidYouTubeURL(youtubeURLText)
+    }
+
+    /// Why the download buttons are dimmed, for the button tooltip.
+    var downloadDisabledReason: String? {
+        if ytDlpPath == nil { return "yt-dlp not found. Open the requirements sheet to install it." }
+        if ffmpegPath == nil { return "ffmpeg not found. Open the requirements sheet to install it." }
+        if isDownloadingYouTube { return "A download is already running." }
+        if !hasValidYouTubeURL { return "Paste a youtube.com or youtu.be link first." }
+        return nil
     }
 
     var canDownloadYouTube: Bool {
@@ -1303,6 +1613,7 @@ final class CompressorModel: ObservableObject {
         isFetchingYoutubePreview = false
 
         let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
+        youtubePreviewError = nil
         guard isValidYouTubeURL(trimmed) else {
             youtubePreviewTitle = nil
             youtubePreviewDuration = nil
@@ -1318,12 +1629,17 @@ final class CompressorModel: ObservableObject {
     }
 
     private func fetchYoutubePreview(for urlString: String) {
-        guard let ytDlpPath else { return }
+        guard let ytDlpPath else {
+            youtubePreviewError = "yt-dlp not found. Open the requirements sheet to install it."
+            log("Cannot fetch video info: yt-dlp not found.")
+            return
+        }
 
         isFetchingYoutubePreview = true
         youtubePreviewTitle = nil
         youtubePreviewDuration = nil
         youtubePreviewThumbnail = nil
+        youtubePreviewError = nil
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytDlpPath)
@@ -1342,22 +1658,53 @@ final class CompressorModel: ObservableObject {
         process.environment = environment
 
         let outputPipe = Pipe()
+        let errorPipe = Pipe()
         process.standardOutput = outputPipe
-        process.standardError = Pipe()
+        process.standardError = errorPipe
         youtubePreviewProcess = process
 
+        // Both pipes are drained on background queues so a chatty yt-dlp can't fill a
+        // 64K buffer and wedge the process before it exits.
+        let collected = PipeCollector()
+        let collectionGroup = DispatchGroup()
+        collectionGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            collected.output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            collectionGroup.leave()
+        }
+        collectionGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            collected.error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            collectionGroup.leave()
+        }
+
         process.terminationHandler = { [weak self] terminatedProcess in
-            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let lines = String(data: data, encoding: .utf8)?
+            collectionGroup.wait()
+            let lines = String(data: collected.output, encoding: .utf8)?
                 .split(separator: "\n")
                 .map(String.init) ?? []
+            let errorText = String(data: collected.error, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             DispatchQueue.main.async {
                 guard let self else { return }
+                // A superseded fetch must not clear the state of the one that replaced it.
+                guard self.youtubePreviewProcess === terminatedProcess else { return }
                 self.youtubePreviewProcess = nil
                 self.isFetchingYoutubePreview = false
 
-                guard terminatedProcess.terminationStatus == 0, lines.count >= 3 else { return }
+                guard terminatedProcess.terminationStatus == 0, lines.count >= 3 else {
+                    // A cancelled fetch (superseded by newer typing) isn't a failure worth showing.
+                    guard terminatedProcess.terminationReason != .uncaughtSignal else { return }
+
+                    let detail = errorText
+                        .split(separator: "\n")
+                        .map(String.init)
+                        .last(where: { !$0.isEmpty }) ?? "yt-dlp exited with code \(terminatedProcess.terminationStatus)."
+                    self.youtubePreviewError = detail
+                    self.log("Could not read video info: \(detail)")
+                    return
+                }
 
                 self.youtubePreviewTitle = lines[0]
                 self.youtubePreviewDuration = Double(lines[1])
@@ -1372,6 +1719,8 @@ final class CompressorModel: ObservableObject {
             try process.run()
         } catch {
             isFetchingYoutubePreview = false
+            youtubePreviewError = "Could not run yt-dlp: \(error.localizedDescription)"
+            log("Could not run yt-dlp: \(error.localizedDescription)")
         }
     }
 
@@ -1386,10 +1735,20 @@ final class CompressorModel: ObservableObject {
         task.resume()
     }
 
+    /// yt-dlp's default player client (currently `android_vr`) intermittently gets
+    /// HTTP 403 on the media URLs it hands back. These clients still resolve the same
+    /// top-quality formats, so a failed first attempt is retried against them.
+    private static let youtubeFallbackClients = "web_embedded,tv_simply,mweb"
+
     func downloadYouTube() {
-        guard let ytDlpPath, let ffmpegPath else { return }
         let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
         guard isValidYouTubeURL(trimmed) else { return }
+        startYouTubeDownload(trimmed, attempt: 0)
+    }
+
+    private func startYouTubeDownload(_ trimmed: String, attempt: Int) {
+        guard let ytDlpPath, let ffmpegPath else { return }
+        let isRetry = attempt > 0
 
         let folder = settings.outputFolder
             ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -1403,6 +1762,10 @@ final class CompressorModel: ObservableObject {
             "-o", folder.appendingPathComponent("%(title).200B [%(id)s].%(ext)s").path
         ]
 
+        if isRetry {
+            args.append(contentsOf: ["--extractor-args", "youtube:player_client=\(Self.youtubeFallbackClients)"])
+        }
+
         switch youtubeKind {
         case .video:
             args.append(contentsOf: ["-f", "bv*+ba/b", "--merge-output-format", "mp4"])
@@ -1413,10 +1776,13 @@ final class CompressorModel: ObservableObject {
 
         isDownloadingYouTube = true
         youtubeDownloadProgress = 0
-        youtubeDownloadStatus = "Starting download..."
-        youtubeDownloadLog = "$ yt-dlp \(args.joined(separator: " "))\n"
+        youtubeDownloadStatus = isRetry ? "Retrying with a different player client..." : "Starting download..."
         youtubeDownloadElapsed = 0
-        log("Downloading \(youtubeKind == .video ? "video" : "audio") with yt-dlp…")
+        if !isRetry {
+            youtubeDownloadLog = ""
+            log("Downloading \(youtubeKind == .video ? "video" : "audio") with yt-dlp…")
+        }
+        youtubeDownloadLog += "$ yt-dlp \(args.joined(separator: " "))\n"
 
         youtubeDownloadTimer?.invalidate()
         let startedAt = Date()
@@ -1487,14 +1853,25 @@ final class CompressorModel: ObservableObject {
                     self.scheduleYoutubePreviewFetch()
                     self.log("✔ Downloaded \(newFile.lastPathComponent).", level: .success)
                     self.addInputs([newFile])
-                } else {
-                    let lastLine = self.youtubeDownloadLog
-                        .split(separator: "\n")
-                        .map(String.init)
-                        .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-                    self.youtubeDownloadStatus = lastLine.map { "Download failed: \($0)" } ?? "Download failed."
-                    self.log("✖ Download failed. \(lastLine ?? "")", level: .error)
+                    return
                 }
+
+                // A cancelled download is not a failure to retry or report.
+                guard process.terminationReason != .uncaughtSignal else { return }
+
+                let lastLine = self.youtubeDownloadLog
+                    .split(separator: "\n")
+                    .map(String.init)
+                    .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+
+                if attempt == 0 {
+                    self.log("First attempt failed (\(lastLine ?? "no output")). Retrying with player clients: \(Self.youtubeFallbackClients)…")
+                    self.startYouTubeDownload(trimmed, attempt: 1)
+                    return
+                }
+
+                self.youtubeDownloadStatus = lastLine.map { "Download failed: \($0)" } ?? "Download failed."
+                self.log("✖ Download failed. \(lastLine ?? "")", level: .error)
             }
         }
 
@@ -1875,6 +2252,13 @@ enum UpdateChecker {
     struct Release {
         let version: String
         let pageURL: URL
+        /// The `.zip` build asset and the `SHA256SUMS.txt` published beside it. Both are
+        /// needed to install in place; without them the app can only open the release page.
+        let zipName: String?
+        let zipURL: URL?
+        let checksumsURL: URL?
+
+        var canInstallInPlace: Bool { zipName != nil && zipURL != nil && checksumsURL != nil }
     }
 
     static func fetchLatest(completion: @escaping (Result<Release, Error>) -> Void) {
@@ -1896,7 +2280,28 @@ enum UpdateChecker {
 
             let page = (json["html_url"] as? String).flatMap(URL.init(string:)) ?? releasesPage
             let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            completion(.success(Release(version: version, pageURL: page)))
+
+            let assets = (json["assets"] as? [[String: Any]]) ?? []
+            func asset(where matches: (String) -> Bool) -> (name: String, url: URL)? {
+                for entry in assets {
+                    guard let name = entry["name"] as? String, matches(name),
+                          let raw = entry["browser_download_url"] as? String,
+                          let url = URL(string: raw) else { continue }
+                    return (name, url)
+                }
+                return nil
+            }
+
+            let zip = asset { $0.hasSuffix(".zip") }
+            let sums = asset { $0 == "SHA256SUMS.txt" }
+
+            completion(.success(Release(
+                version: version,
+                pageURL: page,
+                zipName: zip?.name,
+                zipURL: zip?.url,
+                checksumsURL: sums?.url
+            )))
         }.resume()
     }
 
@@ -2234,6 +2639,57 @@ private final class DroppedURLCollector: @unchecked Sendable {
 }
 
 /// Scrollback of everything the queue has done, reachable by clicking the status strip.
+struct UpdateInstallerView: View {
+    @ObservedObject var model: CompressorModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(model.updateInstallError == nil ? "Updating Squishy" : "Update Failed")
+                .font(.system(.title3, design: .rounded, weight: .bold))
+
+            if let error = model.updateInstallError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(model.updateInstallStatus)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                ProgressView(value: model.updateInstallProgress)
+                    .progressViewStyle(.linear)
+
+                Text("Squishy will quit and reopen once the new version is in place.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Spacer()
+
+                if model.updateInstallError != nil {
+                    if let url = model.updateDownloadURL {
+                        Button("Download Page") { NSWorkspace.shared.open(url) }
+                    }
+                    Button("Close") {
+                        model.updateInstallError = nil
+                        model.showUpdateInstaller = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Cancel", role: .cancel) {
+                        model.cancelUpdateInstall()
+                        model.showUpdateInstaller = false
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
+
 struct ConsoleView: View {
     @ObservedObject var model: CompressorModel
     @Environment(\.dismiss) private var dismiss
@@ -2382,7 +2838,16 @@ struct ContentView: View {
             model.checkForAppUpdates(userInitiated: true)
         }
         .alert(model.updateAlertTitle, isPresented: $model.showUpdateAlert) {
-            if let url = model.updateDownloadURL {
+            if model.canInstallUpdateInPlace {
+                Button("Update Now") {
+                    model.showUpdateInstaller = true
+                    model.installUpdate()
+                }
+                if let url = model.updateDownloadURL {
+                    Button("Download Page") { NSWorkspace.shared.open(url) }
+                }
+                Button("Later", role: .cancel) {}
+            } else if let url = model.updateDownloadURL {
                 Button("Download") { NSWorkspace.shared.open(url) }
                 Button("Later", role: .cancel) {}
             } else {
@@ -2390,6 +2855,9 @@ struct ContentView: View {
             }
         } message: {
             Text(model.updateAlertMessage)
+        }
+        .sheet(isPresented: $model.showUpdateInstaller) {
+            UpdateInstallerView(model: model)
         }
         .sheet(isPresented: $showPrerequisiteOnboarding) {
             PrerequisiteOnboardingView(
@@ -2528,10 +2996,15 @@ struct ContentView: View {
             } else if model.youtubePreviewTitle != nil {
                 youtubePreview
             } else if let hint = model.youtubeURLValidationHint {
-                Label(hint, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                youtubeWarning(hint)
+            } else if let error = model.youtubePreviewError {
+                youtubeWarning("Couldn't load the video details: \(error) You can still try the download.")
+            }
+
+            // The buttons depend only on the link being valid — a failed preview must
+            // never leave the user with no way to start a download.
+            if model.hasValidYouTubeURL {
+                downloadButtons
             }
 
             if model.isDownloadingYouTube {
@@ -2543,6 +3016,20 @@ struct ContentView: View {
                 }
                 .controlSize(.small)
             }
+        }
+    }
+
+    private func youtubeWarning(_ message: String) -> some View {
+        Label(message, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var downloadButtons: some View {
+        HStack(spacing: 8) {
+            downloadButton(title: "Download Video", symbol: "video", kind: .video, prominent: true)
+            downloadButton(title: "Download Audio", symbol: "waveform.mid", kind: .audioOnly, prominent: false)
         }
     }
 
@@ -2596,11 +3083,6 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-
-            HStack(spacing: 8) {
-                downloadButton(title: "Download Video", symbol: "video", kind: .video, prominent: true)
-                downloadButton(title: "Download Audio", symbol: "waveform.mid", kind: .audioOnly, prominent: false)
-            }
         }
     }
 
@@ -2625,12 +3107,17 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .disabled(!model.canDownloadYouTube)
         .opacity(model.canDownloadYouTube ? 1 : 0.55)
+        .help(model.canDownloadYouTube ? title : model.downloadDisabledReason ?? title)
     }
 
     @ViewBuilder
     private var selectedFileContent: some View {
         VStack(spacing: 16) {
             youtubeURLField
+
+            if model.hasValidYouTubeURL {
+                downloadButtons
+            }
 
             if model.items.count == 1, let item = model.items.first {
                 filePreview(item)
