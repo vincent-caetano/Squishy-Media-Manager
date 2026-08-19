@@ -87,6 +87,13 @@ enum SourceKind {
     case image
 }
 
+/// Holds the drained output of a process' pipes; each field is written once by a
+/// single background reader before the termination handler joins on them.
+final class PipeCollector: @unchecked Sendable {
+    var output = Data()
+    var error = Data()
+}
+
 enum YouTubeDownloadKind: String, CaseIterable, Identifiable {
     case video
     case audioOnly
@@ -338,6 +345,7 @@ final class CompressorModel: ObservableObject {
     @Published var youtubePreviewTitle: String?
     @Published var youtubePreviewDuration: Double?
     @Published var youtubePreviewThumbnail: NSImage?
+    @Published var youtubePreviewError: String?
 
     private var youtubeDownloadTimer: Timer?
     private var youtubePreviewDebounceTimer: Timer?
@@ -548,6 +556,21 @@ final class CompressorModel: ObservableObject {
     var ytDlpStatus: String {
         guard let ytDlpPath else { return "yt-dlp not found" }
         return ytDlpPath
+    }
+
+    /// True as soon as the pasted text is a YouTube link, regardless of whether the
+    /// metadata preview succeeded. The download buttons key off this, not the preview.
+    var hasValidYouTubeURL: Bool {
+        isValidYouTubeURL(youtubeURLText)
+    }
+
+    /// Why the download buttons are dimmed, for the button tooltip.
+    var downloadDisabledReason: String? {
+        if ytDlpPath == nil { return "yt-dlp not found. Open the requirements sheet to install it." }
+        if ffmpegPath == nil { return "ffmpeg not found. Open the requirements sheet to install it." }
+        if isDownloadingYouTube { return "A download is already running." }
+        if !hasValidYouTubeURL { return "Paste a youtube.com or youtu.be link first." }
+        return nil
     }
 
     var canDownloadYouTube: Bool {
@@ -1303,6 +1326,7 @@ final class CompressorModel: ObservableObject {
         isFetchingYoutubePreview = false
 
         let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
+        youtubePreviewError = nil
         guard isValidYouTubeURL(trimmed) else {
             youtubePreviewTitle = nil
             youtubePreviewDuration = nil
@@ -1318,12 +1342,17 @@ final class CompressorModel: ObservableObject {
     }
 
     private func fetchYoutubePreview(for urlString: String) {
-        guard let ytDlpPath else { return }
+        guard let ytDlpPath else {
+            youtubePreviewError = "yt-dlp not found. Open the requirements sheet to install it."
+            log("Cannot fetch video info: yt-dlp not found.")
+            return
+        }
 
         isFetchingYoutubePreview = true
         youtubePreviewTitle = nil
         youtubePreviewDuration = nil
         youtubePreviewThumbnail = nil
+        youtubePreviewError = nil
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytDlpPath)
@@ -1342,22 +1371,53 @@ final class CompressorModel: ObservableObject {
         process.environment = environment
 
         let outputPipe = Pipe()
+        let errorPipe = Pipe()
         process.standardOutput = outputPipe
-        process.standardError = Pipe()
+        process.standardError = errorPipe
         youtubePreviewProcess = process
 
+        // Both pipes are drained on background queues so a chatty yt-dlp can't fill a
+        // 64K buffer and wedge the process before it exits.
+        let collected = PipeCollector()
+        let collectionGroup = DispatchGroup()
+        collectionGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            collected.output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            collectionGroup.leave()
+        }
+        collectionGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            collected.error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            collectionGroup.leave()
+        }
+
         process.terminationHandler = { [weak self] terminatedProcess in
-            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let lines = String(data: data, encoding: .utf8)?
+            collectionGroup.wait()
+            let lines = String(data: collected.output, encoding: .utf8)?
                 .split(separator: "\n")
                 .map(String.init) ?? []
+            let errorText = String(data: collected.error, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             DispatchQueue.main.async {
                 guard let self else { return }
+                // A superseded fetch must not clear the state of the one that replaced it.
+                guard self.youtubePreviewProcess === terminatedProcess else { return }
                 self.youtubePreviewProcess = nil
                 self.isFetchingYoutubePreview = false
 
-                guard terminatedProcess.terminationStatus == 0, lines.count >= 3 else { return }
+                guard terminatedProcess.terminationStatus == 0, lines.count >= 3 else {
+                    // A cancelled fetch (superseded by newer typing) isn't a failure worth showing.
+                    guard terminatedProcess.terminationReason != .uncaughtSignal else { return }
+
+                    let detail = errorText
+                        .split(separator: "\n")
+                        .map(String.init)
+                        .last(where: { !$0.isEmpty }) ?? "yt-dlp exited with code \(terminatedProcess.terminationStatus)."
+                    self.youtubePreviewError = detail
+                    self.log("Could not read video info: \(detail)")
+                    return
+                }
 
                 self.youtubePreviewTitle = lines[0]
                 self.youtubePreviewDuration = Double(lines[1])
@@ -1372,6 +1432,8 @@ final class CompressorModel: ObservableObject {
             try process.run()
         } catch {
             isFetchingYoutubePreview = false
+            youtubePreviewError = "Could not run yt-dlp: \(error.localizedDescription)"
+            log("Could not run yt-dlp: \(error.localizedDescription)")
         }
     }
 
@@ -1386,10 +1448,20 @@ final class CompressorModel: ObservableObject {
         task.resume()
     }
 
+    /// yt-dlp's default player client (currently `android_vr`) intermittently gets
+    /// HTTP 403 on the media URLs it hands back. These clients still resolve the same
+    /// top-quality formats, so a failed first attempt is retried against them.
+    private static let youtubeFallbackClients = "web_embedded,tv_simply,mweb"
+
     func downloadYouTube() {
-        guard let ytDlpPath, let ffmpegPath else { return }
         let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
         guard isValidYouTubeURL(trimmed) else { return }
+        startYouTubeDownload(trimmed, attempt: 0)
+    }
+
+    private func startYouTubeDownload(_ trimmed: String, attempt: Int) {
+        guard let ytDlpPath, let ffmpegPath else { return }
+        let isRetry = attempt > 0
 
         let folder = settings.outputFolder
             ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -1403,6 +1475,10 @@ final class CompressorModel: ObservableObject {
             "-o", folder.appendingPathComponent("%(title).200B [%(id)s].%(ext)s").path
         ]
 
+        if isRetry {
+            args.append(contentsOf: ["--extractor-args", "youtube:player_client=\(Self.youtubeFallbackClients)"])
+        }
+
         switch youtubeKind {
         case .video:
             args.append(contentsOf: ["-f", "bv*+ba/b", "--merge-output-format", "mp4"])
@@ -1413,10 +1489,13 @@ final class CompressorModel: ObservableObject {
 
         isDownloadingYouTube = true
         youtubeDownloadProgress = 0
-        youtubeDownloadStatus = "Starting download..."
-        youtubeDownloadLog = "$ yt-dlp \(args.joined(separator: " "))\n"
+        youtubeDownloadStatus = isRetry ? "Retrying with a different player client..." : "Starting download..."
         youtubeDownloadElapsed = 0
-        log("Downloading \(youtubeKind == .video ? "video" : "audio") with yt-dlp…")
+        if !isRetry {
+            youtubeDownloadLog = ""
+            log("Downloading \(youtubeKind == .video ? "video" : "audio") with yt-dlp…")
+        }
+        youtubeDownloadLog += "$ yt-dlp \(args.joined(separator: " "))\n"
 
         youtubeDownloadTimer?.invalidate()
         let startedAt = Date()
@@ -1487,14 +1566,25 @@ final class CompressorModel: ObservableObject {
                     self.scheduleYoutubePreviewFetch()
                     self.log("✔ Downloaded \(newFile.lastPathComponent).", level: .success)
                     self.addInputs([newFile])
-                } else {
-                    let lastLine = self.youtubeDownloadLog
-                        .split(separator: "\n")
-                        .map(String.init)
-                        .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-                    self.youtubeDownloadStatus = lastLine.map { "Download failed: \($0)" } ?? "Download failed."
-                    self.log("✖ Download failed. \(lastLine ?? "")", level: .error)
+                    return
                 }
+
+                // A cancelled download is not a failure to retry or report.
+                guard process.terminationReason != .uncaughtSignal else { return }
+
+                let lastLine = self.youtubeDownloadLog
+                    .split(separator: "\n")
+                    .map(String.init)
+                    .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+
+                if attempt == 0 {
+                    self.log("First attempt failed (\(lastLine ?? "no output")). Retrying with player clients: \(Self.youtubeFallbackClients)…")
+                    self.startYouTubeDownload(trimmed, attempt: 1)
+                    return
+                }
+
+                self.youtubeDownloadStatus = lastLine.map { "Download failed: \($0)" } ?? "Download failed."
+                self.log("✖ Download failed. \(lastLine ?? "")", level: .error)
             }
         }
 
@@ -2528,10 +2618,15 @@ struct ContentView: View {
             } else if model.youtubePreviewTitle != nil {
                 youtubePreview
             } else if let hint = model.youtubeURLValidationHint {
-                Label(hint, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                youtubeWarning(hint)
+            } else if let error = model.youtubePreviewError {
+                youtubeWarning("Couldn't load the video details: \(error) You can still try the download.")
+            }
+
+            // The buttons depend only on the link being valid — a failed preview must
+            // never leave the user with no way to start a download.
+            if model.hasValidYouTubeURL {
+                downloadButtons
             }
 
             if model.isDownloadingYouTube {
@@ -2543,6 +2638,20 @@ struct ContentView: View {
                 }
                 .controlSize(.small)
             }
+        }
+    }
+
+    private func youtubeWarning(_ message: String) -> some View {
+        Label(message, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var downloadButtons: some View {
+        HStack(spacing: 8) {
+            downloadButton(title: "Download Video", symbol: "video", kind: .video, prominent: true)
+            downloadButton(title: "Download Audio", symbol: "waveform.mid", kind: .audioOnly, prominent: false)
         }
     }
 
@@ -2596,11 +2705,6 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-
-            HStack(spacing: 8) {
-                downloadButton(title: "Download Video", symbol: "video", kind: .video, prominent: true)
-                downloadButton(title: "Download Audio", symbol: "waveform.mid", kind: .audioOnly, prominent: false)
-            }
         }
     }
 
@@ -2625,12 +2729,17 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .disabled(!model.canDownloadYouTube)
         .opacity(model.canDownloadYouTube ? 1 : 0.55)
+        .help(model.canDownloadYouTube ? title : model.downloadDisabledReason ?? title)
     }
 
     @ViewBuilder
     private var selectedFileContent: some View {
         VStack(spacing: 16) {
             youtubeURLField
+
+            if model.hasValidYouTubeURL {
+                downloadButtons
+            }
 
             if model.items.count == 1, let item = model.items.first {
                 filePreview(item)
