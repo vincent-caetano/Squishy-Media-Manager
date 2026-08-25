@@ -103,6 +103,41 @@ enum YouTubeDownloadKind: String, CaseIterable, Identifiable {
     var title: String { self == .video ? "Video" : "Audio Only" }
 }
 
+/// One downloadable video quality, collapsed from every yt-dlp format that shares a
+/// height down to the single stream this app would actually fetch.
+struct YouTubeQualityOption: Identifiable, Equatable {
+    let height: Int
+    /// YouTube's own name for the rung ("2160p", "1080p60"). It tracks the long edge,
+    /// so on anything wider than 16:9 it differs from the height — this video's 2160p
+    /// stream is 3840×1920, and listing it as "1920p" would match no label the user
+    /// has ever seen for it.
+    let label: String
+    let formatID: String?
+    /// Approximate total for the merged file: the chosen video stream plus the audio
+    /// paired with it. Nil when the extractor reported no size.
+    let sizeBytes: Int64?
+
+    var id: Int { height }
+
+    var title: String { label }
+
+    var detail: String {
+        guard let sizeBytes else { return "MP4" }
+        return "MP4 · \(ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file))"
+    }
+
+    /// The exact stream whose size was quoted, so the download can't quietly land on a
+    /// different codec than the one priced in the list. YouTube itags are stable, but
+    /// the height cap still backs it up if the id ever stops resolving.
+    var formatSelector: String {
+        let capped = "bv*[height<=\(height)]+ba/b[height<=\(height)]"
+        guard let formatID else { return capped }
+        // M4A first so the merge into MP4 is a straight copy; YouTube's other audio
+        // streams are Opus, which only reaches the container by being re-encoded.
+        return "\(formatID)+ba[ext=m4a]/\(formatID)+ba/\(formatID)/\(capped)"
+    }
+}
+
 enum ResolutionOption: String, CaseIterable, Identifiable {
     case original
     case p2160
@@ -224,6 +259,9 @@ struct MediaItem: Identifiable {
     var state: ItemState = .queued
     var progress: Double = 0
     var statusDetail = ""
+    /// The link this file was downloaded from, kept so it can be copied back out of
+    /// the queue. Nil for files added from disk.
+    var sourceLink: String?
 
     init(url: URL, kind: SourceKind) {
         self.url = url
@@ -334,8 +372,21 @@ final class CompressorModel: ObservableObject {
     /// How many ffmpeg exports may run at the same time.
     let maxConcurrentJobs = 5
 
-    @Published var youtubeURLText = ""
+    /// The preview fetch is driven from here rather than an `onChange` on the URL field:
+    /// the field is part of a layout that swaps as soon as text arrives, and a view that
+    /// SwiftUI replaces during the same update never delivers its `onChange`, so a pasted
+    /// link would silently never be fetched.
+    @Published var youtubeURLText = "" {
+        didSet {
+            guard youtubeURLText != oldValue else { return }
+            guard !consumeDroppedFilePaths() else { return }
+            scheduleYoutubePreviewFetch()
+        }
+    }
     @Published var youtubeKind: YouTubeDownloadKind = .video
+    /// Nil means "best available" — the selector used before qualities were listed, and
+    /// still the fallback whenever the format probe came back empty.
+    @Published var youtubeQuality: YouTubeQualityOption?
     @Published var isDownloadingYouTube = false
     @Published var youtubeDownloadProgress: Double = 0
     @Published var youtubeDownloadStatus = "Paste a YouTube link to download."
@@ -346,7 +397,13 @@ final class CompressorModel: ObservableObject {
     @Published var youtubePreviewTitle: String?
     @Published var youtubePreviewDuration: Double?
     @Published var youtubePreviewThumbnail: NSImage?
+    @Published var youtubeQualityOptions: [YouTubeQualityOption] = []
+    @Published var youtubeAudioSizeBytes: Int64?
     @Published var youtubePreviewError: String?
+
+    /// The URL whose extraction is currently cached at `youtubeInfoJSONURL`, or nil
+    /// when there is nothing reusable on disk.
+    private var youtubeInfoJSONSource: String?
 
     private var youtubeDownloadTimer: Timer?
     private var youtubePreviewDebounceTimer: Timer?
@@ -1092,7 +1149,7 @@ final class CompressorModel: ObservableObject {
         }
     }
 
-    func addInputs(_ urls: [URL]) {
+    func addInputs(_ urls: [URL], sourceLink: String? = nil) {
         var addedIDs: [UUID] = []
 
         for url in urls {
@@ -1101,6 +1158,7 @@ final class CompressorModel: ObservableObject {
             let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
             item.fileSizeBytes = attributes?[.size] as? Int64
             item.creationDate = attributes?[.creationDate] as? Date
+            item.sourceLink = sourceLink
             items.append(item)
             addedIDs.append(item.id)
         }
@@ -1120,6 +1178,15 @@ final class CompressorModel: ObservableObject {
         for id in addedIDs {
             loadDetails(for: id)
         }
+    }
+
+    /// Puts a queued item's originating link back on the pasteboard.
+    func copySourceLink(_ item: MediaItem) {
+        guard let sourceLink = item.sourceLink else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(sourceLink, forType: .string)
+        statusText = "Copied video link to clipboard."
+        log("Copied link for \(item.url.lastPathComponent): \(sourceLink)")
     }
 
     func removeItem(_ id: UUID) {
@@ -1618,6 +1685,10 @@ final class CompressorModel: ObservableObject {
             youtubePreviewTitle = nil
             youtubePreviewDuration = nil
             youtubePreviewThumbnail = nil
+            youtubeQualityOptions = []
+            youtubeAudioSizeBytes = nil
+            youtubeQuality = nil
+            youtubeInfoJSONSource = nil
             return
         }
 
@@ -1639,15 +1710,20 @@ final class CompressorModel: ObservableObject {
         youtubePreviewTitle = nil
         youtubePreviewDuration = nil
         youtubePreviewThumbnail = nil
+        youtubeQualityOptions = []
+        youtubeAudioSizeBytes = nil
+        youtubeQuality = nil
+        youtubeInfoJSONSource = nil
         youtubePreviewError = nil
 
+        // `-J` costs no extra extraction over `--print` but carries the whole format
+        // table, which is what the quality list is built from. HLS is skipped: those
+        // entries never win the ranking, and asking for them adds a manifest round trip.
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytDlpPath)
         process.arguments = [
-            "--no-playlist", "--skip-download",
-            "--print", "%(title)s",
-            "--print", "%(duration)s",
-            "--print", "%(thumbnail)s",
+            "--no-playlist", "-J",
+            "--extractor-args", Self.youtubeExtractorArgs,
             urlString
         ]
 
@@ -1680,9 +1756,9 @@ final class CompressorModel: ObservableObject {
 
         process.terminationHandler = { [weak self] terminatedProcess in
             collectionGroup.wait()
-            let lines = String(data: collected.output, encoding: .utf8)?
-                .split(separator: "\n")
-                .map(String.init) ?? []
+            let info = Self.parseYoutubeInfo(collected.output)
+            // Kept on disk so the download can skip repeating this extraction.
+            let cached = (try? collected.output.write(to: Self.youtubeInfoJSONURL)) != nil
             let errorText = String(data: collected.error, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
@@ -1693,7 +1769,7 @@ final class CompressorModel: ObservableObject {
                 self.youtubePreviewProcess = nil
                 self.isFetchingYoutubePreview = false
 
-                guard terminatedProcess.terminationStatus == 0, lines.count >= 3 else {
+                guard terminatedProcess.terminationStatus == 0, let info else {
                     // A cancelled fetch (superseded by newer typing) isn't a failure worth showing.
                     guard terminatedProcess.terminationReason != .uncaughtSignal else { return }
 
@@ -1706,10 +1782,14 @@ final class CompressorModel: ObservableObject {
                     return
                 }
 
-                self.youtubePreviewTitle = lines[0]
-                self.youtubePreviewDuration = Double(lines[1])
+                self.youtubePreviewTitle = info.title
+                self.youtubePreviewDuration = info.duration
+                self.youtubeQualityOptions = info.qualities
+                self.youtubeAudioSizeBytes = info.audioSize
+                self.youtubeQuality = Self.defaultQuality(from: info.qualities)
+                self.youtubeInfoJSONSource = cached ? urlString : nil
 
-                if let thumbnailURL = URL(string: lines[2]) {
+                if let thumbnail = info.thumbnail, let thumbnailURL = URL(string: thumbnail) {
                     self.loadYoutubePreviewThumbnail(from: thumbnailURL)
                 }
             }
@@ -1724,6 +1804,101 @@ final class CompressorModel: ObservableObject {
         }
     }
 
+    /// Collapses yt-dlp's format table into one row per height, keeping the stream this
+    /// app would actually download at each.
+    nonisolated private static func parseYoutubeInfo(
+        _ data: Data
+    ) -> (title: String, duration: Double?, thumbnail: String?, qualities: [YouTubeQualityOption], audioSize: Int64?)? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let title = root["title"] as? String else { return nil }
+
+        let formats = root["formats"] as? [[String: Any]] ?? []
+
+        func size(_ format: [String: Any]) -> Int64? {
+            (format["filesize"] as? NSNumber)?.int64Value
+                ?? (format["filesize_approx"] as? NSNumber)?.int64Value
+        }
+        func bitrate(_ format: [String: Any]) -> Double {
+            (format["tbr"] as? NSNumber)?.doubleValue ?? 0
+        }
+        /// Prefer plain-HTTPS MP4 streams: HLS manifests report an inflated `tbr` and no
+        /// size at all, and a non-MP4 stream has to be remuxed on the way into the
+        /// container this app asks for.
+        func tier(_ format: [String: Any]) -> Int {
+            guard (format["protocol"] as? String ?? "").hasPrefix("http") else { return 0 }
+            return (format["ext"] as? String) == "mp4" ? 2 : 1
+        }
+        func outranks(_ format: [String: Any], _ incumbent: [String: Any]) -> Bool {
+            let (lhs, rhs) = (tier(format), tier(incumbent))
+            return lhs == rhs ? bitrate(format) > bitrate(incumbent) : lhs > rhs
+        }
+
+        /// Mirrors the M4A preference baked into `formatSelector`, so the size quoted
+        /// for a rung is the size of the audio that actually gets merged into it.
+        func audioOutranks(_ format: [String: Any], _ incumbent: [String: Any]) -> Bool {
+            let isM4A = (format["ext"] as? String) == "m4a"
+            guard isM4A == ((incumbent["ext"] as? String) == "m4a") else { return isM4A }
+            return bitrate(format) > bitrate(incumbent)
+        }
+
+        var bestAudio: [String: Any]?
+        var bestByHeight: [Int: [String: Any]] = [:]
+
+        for format in formats {
+            let hasVideo = (format["vcodec"] as? String ?? "none") != "none"
+            let hasAudio = (format["acodec"] as? String ?? "none") != "none"
+
+            guard hasVideo else {
+                guard hasAudio else { continue }
+                if bestAudio.map({ audioOutranks(format, $0) }) ?? true { bestAudio = format }
+                continue
+            }
+            guard let height = (format["height"] as? NSNumber)?.intValue, height > 0 else { continue }
+            guard let incumbent = bestByHeight[height] else {
+                bestByHeight[height] = format
+                continue
+            }
+            if outranks(format, incumbent) { bestByHeight[height] = format }
+        }
+
+        let audioSize = bestAudio.flatMap(size)
+
+        let qualities = bestByHeight
+            .sorted { $0.key > $1.key }
+            .map { height, format -> YouTubeQualityOption in
+                let isMuxed = (format["acodec"] as? String ?? "none") != "none"
+                let total = size(format).map { $0 + (isMuxed ? 0 : (audioSize ?? 0)) }
+                return YouTubeQualityOption(
+                    height: height,
+                    label: qualityLabel(for: format, height: height),
+                    formatID: format["format_id"] as? String,
+                    sizeBytes: total
+                )
+            }
+
+        return (
+            title,
+            (root["duration"] as? NSNumber)?.doubleValue,
+            root["thumbnail"] as? String,
+            qualities,
+            audioSize
+        )
+    }
+
+    /// yt-dlp's `format_note` already carries the familiar rung name, including the fps
+    /// suffix on high-frame-rate streams. Anything else there (codec blurbs, "Default")
+    /// is discarded in favour of the height.
+    nonisolated private static func qualityLabel(for format: [String: Any], height: Int) -> String {
+        let fallback = "\(height)p"
+        guard let note = format["format_note"] as? String else { return fallback }
+        let parts = note.split(separator: "p", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              parts[0].count >= 3,
+              parts[0].allSatisfy(\.isNumber),
+              parts[1].allSatisfy(\.isNumber) else { return fallback }
+        return note
+    }
+
     private func loadYoutubePreviewThumbnail(from url: URL) {
         let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let data, let image = NSImage(data: data) else { return }
@@ -1735,14 +1910,36 @@ final class CompressorModel: ObservableObject {
         task.resume()
     }
 
+    nonisolated static let youtubeInfoJSONURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("squishy-youtube-info.json")
+
+    /// HLS variants are ranked below plain HTTPS everywhere in this app, so fetching the
+    /// manifest only costs a round trip and pads the format table with rows nothing reads.
+    nonisolated static let youtubeExtractorArgs = "youtube:skip=hls"
+
+    /// Used when no rung was picked — a failed probe, or the plain buttons. Capped at
+    /// 1080p because "best available" on a 4K upload is several hundred megabytes, which
+    /// is the bulk of why a download feels slow. The trailing branch keeps uploads that
+    /// only publish above 1080p working.
+    nonisolated static let defaultVideoSelector =
+        "bv*[height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+
+    /// Mirrors `defaultVideoSelector` for the pre-selected row in the quality list.
+    nonisolated static func defaultQuality(from qualities: [YouTubeQualityOption]) -> YouTubeQualityOption? {
+        qualities.first { $0.height <= 1080 } ?? qualities.last
+    }
+
     /// yt-dlp's default player client (currently `android_vr`) intermittently gets
     /// HTTP 403 on the media URLs it hands back. These clients still resolve the same
     /// top-quality formats, so a failed first attempt is retried against them.
     private static let youtubeFallbackClients = "web_embedded,tv_simply,mweb"
 
-    func downloadYouTube() {
+    /// `quality` is ignored for audio-only downloads; nil falls back to best available.
+    func downloadYouTube(kind: YouTubeDownloadKind = .video, quality: YouTubeQualityOption? = nil) {
         let trimmed = Self.normalizedYouTubeURLText(youtubeURLText)
         guard isValidYouTubeURL(trimmed) else { return }
+        youtubeKind = kind
+        if kind == .video { youtubeQuality = quality }
         startYouTubeDownload(trimmed, attempt: 0)
     }
 
@@ -1756,23 +1953,36 @@ final class CompressorModel: ObservableObject {
         let ffmpegFolder = (ffmpegPath as NSString).deletingLastPathComponent
         let beforeNames = Set((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil))?.map { $0.lastPathComponent } ?? [])
 
+        // The preview already resolved this link. Handing that result back cuts a full
+        // extraction — about two seconds — off every download. A retry re-extracts, so
+        // an expired cache costs nothing beyond the attempt it was already going to make.
+        let reusesCachedInfo = !isRetry && youtubeInfoJSONSource == trimmed
+
         var args = [
             "--newline", "--no-playlist",
             "--ffmpeg-location", ffmpegFolder,
+            "-N", "4",
             "-o", folder.appendingPathComponent("%(title).200B [%(id)s].%(ext)s").path
         ]
 
-        if isRetry {
-            args.append(contentsOf: ["--extractor-args", "youtube:player_client=\(Self.youtubeFallbackClients)"])
-        }
-
         switch youtubeKind {
         case .video:
-            args.append(contentsOf: ["-f", "bv*+ba/b", "--merge-output-format", "mp4"])
+            let selector = youtubeQuality?.formatSelector ?? Self.defaultVideoSelector
+            args.append(contentsOf: ["-f", selector, "--merge-output-format", "mp4"])
         case .audioOnly:
             args.append(contentsOf: ["-x", "--audio-format", "m4a"])
         }
-        args.append(trimmed)
+
+        if reusesCachedInfo {
+            // `--load-info-json` supplies the video in place of the URL argument.
+            args.append(contentsOf: ["--load-info-json", Self.youtubeInfoJSONURL.path])
+        } else {
+            let extractorArgs = isRetry
+                ? "\(Self.youtubeExtractorArgs);player_client=\(Self.youtubeFallbackClients)"
+                : Self.youtubeExtractorArgs
+            args.append(contentsOf: ["--extractor-args", extractorArgs])
+            args.append(trimmed)
+        }
 
         isDownloadingYouTube = true
         youtubeDownloadProgress = 0
@@ -1780,7 +1990,8 @@ final class CompressorModel: ObservableObject {
         youtubeDownloadElapsed = 0
         if !isRetry {
             youtubeDownloadLog = ""
-            log("Downloading \(youtubeKind == .video ? "video" : "audio") with yt-dlp…")
+            let what = youtubeKind == .video ? (youtubeQuality?.title ?? "best quality") + " video" : "audio"
+            log("Downloading \(what) with yt-dlp…")
         }
         youtubeDownloadLog += "$ yt-dlp \(args.joined(separator: " "))\n"
 
@@ -1850,9 +2061,8 @@ final class CompressorModel: ObservableObject {
                     self.youtubeDownloadProgress = 1
                     self.youtubeDownloadStatus = "Download complete in \(Int(self.youtubeDownloadElapsed))s."
                     self.youtubeURLText = ""
-                    self.scheduleYoutubePreviewFetch()
                     self.log("✔ Downloaded \(newFile.lastPathComponent).", level: .success)
-                    self.addInputs([newFile])
+                    self.addInputs([newFile], sourceLink: trimmed)
                     return
                 }
 
@@ -2795,6 +3005,52 @@ private extension Color {
     static let squishyBorder = Color.black.opacity(0.08)
 }
 
+/// A row in the YouTube quality list. Kept as its own view so the hover highlight is
+/// local state instead of a per-row flag threaded through `ContentView`.
+struct QualityRow: View {
+    let title: String
+    let detail: String
+    let symbol: String
+    let isEnabled: Bool
+    let help: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: symbol)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.squishyBlue)
+                    .frame(width: 18)
+
+                Text(title)
+                    .font(.system(.body, design: .rounded, weight: .semibold))
+
+                Spacer(minLength: 8)
+
+                Text(detail)
+                    .font(.system(.caption, design: .rounded, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                Image(systemName: "arrow.down.circle")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(isHovering ? Color.squishyBlue : .secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isHovering && isEnabled ? Color.squishyBlue.opacity(0.1) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.55)
+        .onHover { isHovering = $0 }
+        .help(help)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = CompressorModel()
     @AppStorage("hasCompletedPrerequisiteOnboarding") private var hasCompletedPrerequisiteOnboarding = false
@@ -2890,10 +3146,8 @@ struct ContentView: View {
                 Group {
                     if !model.items.isEmpty {
                         selectedFileContent
-                    } else if model.youtubePreviewTitle != nil || model.isFetchingYoutubePreview || !model.youtubeURLText.isEmpty {
-                        youtubeContent
                     } else {
-                        emptySourceContent
+                        youtubeSourceContent
                     }
                 }
 
@@ -2946,43 +3200,47 @@ struct ContentView: View {
         .help(help)
     }
 
-    private var emptySourceContent: some View {
-        VStack(spacing: 32) {
-            Button {
-                model.chooseInput()
-            } label: {
-                VStack(spacing: 16) {
-                    Image(systemName: "plus.rectangle.on.folder")
-                        .font(.system(size: 72, weight: .regular))
-                        .foregroundStyle(Color.squishyBlue)
+    private var dropZone: some View {
+        Button {
+            model.chooseInput()
+        } label: {
+            VStack(spacing: 16) {
+                Image(systemName: "plus.rectangle.on.folder")
+                    .font(.system(size: 72, weight: .regular))
+                    .foregroundStyle(Color.squishyBlue)
 
-                    VStack(spacing: 4) {
-                        Text("Drop media here")
-                            .font(.system(.body, design: .rounded, weight: .bold))
-                            .foregroundStyle(.primary)
-                        Text("or click to choose a file")
-                            .font(.system(.body, design: .rounded, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
+                VStack(spacing: 4) {
+                    Text("Drop media here")
+                        .font(.system(.body, design: .rounded, weight: .bold))
+                        .foregroundStyle(.primary)
+                    Text("or click to choose a file")
+                        .font(.system(.body, design: .rounded, weight: .medium))
+                        .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .frame(height: 284)
-            .background(Color.squishyField)
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.black.opacity(0.16), style: StrokeStyle(lineWidth: 1, dash: [8, 6]))
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            youtubeURLField
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .frame(height: 284)
+        .background(Color.squishyField)
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.black.opacity(0.16), style: StrokeStyle(lineWidth: 1, dash: [8, 6]))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
-    private var youtubeContent: some View {
+    /// The drop zone, the URL field, and the link preview share one stack so the field
+    /// keeps its slot in the view tree as the drop zone comes and goes. Rebuilding the
+    /// field would drop keyboard focus mid-paste.
+    private var youtubeSourceContent: some View {
         VStack(spacing: 16) {
+            if model.youtubeURLText.isEmpty && !model.isFetchingYoutubePreview && model.youtubePreviewTitle == nil {
+                dropZone
+                    .padding(.bottom, 16)
+            }
+
             youtubeURLField
 
             if model.isFetchingYoutubePreview {
@@ -3001,11 +3259,7 @@ struct ContentView: View {
                 youtubeWarning("Couldn't load the video details: \(error) You can still try the download.")
             }
 
-            // The buttons depend only on the link being valid — a failed preview must
-            // never leave the user with no way to start a download.
-            if model.hasValidYouTubeURL {
-                downloadButtons
-            }
+            downloadControls
 
             if model.isDownloadingYouTube {
                 ProgressView(value: model.youtubeDownloadProgress > 0 ? model.youtubeDownloadProgress : nil)
@@ -3026,11 +3280,93 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// The quality list once the formats are known, the plain pair of buttons until
+    /// then — a probe that failed must still leave a way to start a download.
+    @ViewBuilder
+    private var downloadControls: some View {
+        if model.hasValidYouTubeURL {
+            if model.youtubeQualityOptions.isEmpty {
+                downloadButtons
+            } else {
+                qualityList
+            }
+        }
+    }
+
     private var downloadButtons: some View {
         HStack(spacing: 8) {
             downloadButton(title: "Download Video", symbol: "video", kind: .video, prominent: true)
             downloadButton(title: "Download Audio", symbol: "waveform.mid", kind: .audioOnly, prominent: false)
         }
+    }
+
+    private var qualityList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Choose a quality")
+                .font(.system(.caption, design: .rounded, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(model.youtubeQualityOptions) { option in
+                        qualityRow(option)
+                    }
+                    audioQualityRow
+                }
+            }
+            .frame(maxHeight: 232)
+            .background(Color.squishyField, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.squishyBorder, lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+
+    private func qualityRow(_ option: YouTubeQualityOption) -> some View {
+        let isFirst: Bool = model.youtubeQualityOptions.first == option
+        return VStack(spacing: 0) {
+            if !isFirst { qualityDivider }
+            QualityRow(
+                title: option.title,
+                detail: option.detail,
+                symbol: "video",
+                isEnabled: model.canDownloadYouTube,
+                help: downloadHelp("Download \(option.title)"),
+                action: { model.downloadYouTube(kind: .video, quality: option) }
+            )
+        }
+    }
+
+    private var audioQualityRow: some View {
+        VStack(spacing: 0) {
+            qualityDivider
+            QualityRow(
+                title: "Audio only",
+                detail: audioRowDetail,
+                symbol: "waveform.mid",
+                isEnabled: model.canDownloadYouTube,
+                help: downloadHelp("Download the audio track"),
+                action: { model.downloadYouTube(kind: .audioOnly) }
+            )
+        }
+    }
+
+    private var audioRowDetail: String {
+        guard let bytes = model.youtubeAudioSizeBytes else { return "M4A" }
+        return "M4A · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))"
+    }
+
+    private func downloadHelp(_ label: String) -> String {
+        model.canDownloadYouTube ? label : (model.downloadDisabledReason ?? label)
+    }
+
+    private var qualityDivider: some View {
+        Rectangle()
+            .fill(Color.squishyBorder)
+            .frame(height: 1)
+            .padding(.leading, 40)
     }
 
     private var youtubeURLField: some View {
@@ -3044,10 +3380,6 @@ struct ContentView: View {
                     .stroke(Color.squishyBorder, lineWidth: 1)
             }
             .disabled(model.isDownloadingYouTube)
-            .onChange(of: model.youtubeURLText) {
-                guard !model.consumeDroppedFilePaths() else { return }
-                model.scheduleYoutubePreviewFetch()
-            }
     }
 
     private var youtubePreview: some View {
@@ -3093,8 +3425,7 @@ struct ContentView: View {
         prominent: Bool
     ) -> some View {
         Button {
-            model.youtubeKind = kind
-            model.downloadYouTube()
+            model.downloadYouTube(kind: kind)
         } label: {
             Label(title, systemImage: symbol)
                 .font(.system(.body, design: .rounded, weight: .medium))
@@ -3115,9 +3446,7 @@ struct ContentView: View {
         VStack(spacing: 16) {
             youtubeURLField
 
-            if model.hasValidYouTubeURL {
-                downloadButtons
-            }
+            downloadControls
 
             if model.items.count == 1, let item = model.items.first {
                 filePreview(item)
@@ -3180,6 +3509,20 @@ struct ContentView: View {
 
                 stateBadge(item)
 
+                if item.sourceLink != nil {
+                    Button {
+                        model.copySourceLink(item)
+                    } label: {
+                        Image(systemName: "link")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(Color.squishyBlue)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy video link")
+                }
+
                 Button {
                     model.removeItem(item.id)
                 } label: {
@@ -3210,6 +3553,9 @@ struct ContentView: View {
         .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .onTapGesture { model.selectedItemID = item.id }
         .contextMenu {
+            if item.sourceLink != nil {
+                Button("Copy Video Link") { model.copySourceLink(item) }
+            }
             if case let .finished(url) = item.state {
                 Button("Reveal Output") {
                     NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -3321,6 +3667,26 @@ struct ContentView: View {
                 metadataRow("Date Created", item.creationDateText)
                 metadataRow("Format", item.metadata?.videoCodec?.uppercased() ?? model.settings.format.title)
                 metadataRow("Audio", item.kind == .image ? "No audio" : (item.metadata?.audioText ?? "—"))
+
+                if let sourceLink = item.sourceLink {
+                    HStack(spacing: 12) {
+                        Text("Video Link")
+                            .font(.system(.caption, design: .rounded, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Button {
+                            model.copySourceLink(item)
+                        } label: {
+                            Label(sourceLink, systemImage: "link")
+                                .font(.system(.caption, design: .rounded, weight: .semibold))
+                                .foregroundStyle(Color.squishyBlue)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copy video link")
+                    }
+                }
             }
             .padding(12)
             .background(Color.squishyField, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
