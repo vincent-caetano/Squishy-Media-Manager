@@ -4,24 +4,24 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Squishy</string>
 	<key>CFBundleExecutable</key>
+	<string>Squishy</string>
+	<key>CFBundleIconFile</key>
 	<string>Squishy</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.squishy</string>
-	<key>CFBundleIconFile</key>
-	<string>Squishy</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>Squishy</string>
-	<key>CFBundleDisplayName</key>
-	<string>Squishy</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3.1</string>
+	<string>0.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>4</string>
+	<string>5</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
